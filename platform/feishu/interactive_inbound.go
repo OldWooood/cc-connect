@@ -183,6 +183,7 @@ func extractInteractiveReceiveParts(content string) (parts []string, imageKeys [
 	var card struct {
 		Title    string          `json:"title"`
 		Elements json.RawMessage `json:"elements"`
+		CardLink json.RawMessage `json:"card_link"`
 	}
 	if err := json.Unmarshal([]byte(content), &card); err != nil {
 		return nil, nil
@@ -213,6 +214,7 @@ func extractInteractiveReceiveParts(content string) (parts []string, imageKeys [
 	for _, raw := range flattenInteractiveRows(card.Elements) {
 		appendInteractiveReceiveElement(raw, &parts, &imageKeys)
 	}
+	appendCardLinkRaw(card.CardLink, &parts)
 	return parts, imageKeys
 }
 
@@ -355,6 +357,7 @@ type card2Element struct {
 	UserName    string            `json:"user_name"`
 	ImageKey    string            `json:"image_key"`
 	Placeholder string            `json:"placeholder"`
+	URL         string            `json:"url"`
 	Level       int               `json:"level"`
 	Property    card2Property     `json:"property"`
 	Elements    []json.RawMessage `json:"elements"`
@@ -501,6 +504,8 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 		switch {
 		case label != "" && openURL != "":
 			*parts = append(*parts, fmt.Sprintf("[%s](%s)", label, openURL))
+		case label != "" && elem.URL != "":
+			*parts = append(*parts, fmt.Sprintf("[%s](%s)", label, elem.URL))
 		case label != "":
 			*parts = append(*parts, label)
 		}
@@ -689,6 +694,32 @@ func mustMarshal(v any) []byte {
 	return b
 }
 
+// appendCardLink extracts the whole-card jump link (card_link.url, with
+// per-platform fallbacks) so the agent knows where tapping the card leads.
+// Rendered after the body content to keep the card text contiguous.
+func appendCardLinkRaw(raw json.RawMessage, parts *[]string) {
+	if len(raw) == 0 {
+		return
+	}
+	var link struct {
+		URL        string `json:"url"`
+		PCURL      string `json:"pc_url"`
+		PCURLC     string `json:"pcURL"`
+		AndroidURL string `json:"android_url"`
+		IOSURL     string `json:"ios_url"`
+	}
+	if json.Unmarshal(raw, &link) != nil {
+		return
+	}
+	if url := firstNonEmpty(link.URL, link.PCURL, link.PCURLC, link.AndroidURL, link.IOSURL); url != "" {
+		*parts = append(*parts, "[卡片链接]("+url+")")
+	}
+}
+
+func appendCardLink(card map[string]json.RawMessage, parts *[]string) {
+	appendCardLinkRaw(card["card_link"], parts)
+}
+
 // extractCard2RawParts parses a Card 2.0 original payload: either the direct
 // card JSON (user_card_content) or the {"json_card": "..."} wrapper
 // (raw_card_content). Returns nil when the input is not a 2.0 card so the
@@ -771,6 +802,7 @@ func extractCard2RawParts(cardJSON string, keyMap map[string]string) (parts []st
 	} else {
 		appendCard2Element(body, &parts, &imageKeys, keyMap)
 	}
+	appendCardLink(card, &parts)
 	if len(parts) == 0 && len(imageKeys) == 0 {
 		return nil, nil
 	}

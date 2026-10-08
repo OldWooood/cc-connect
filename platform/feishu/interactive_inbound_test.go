@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -675,5 +676,38 @@ func TestResolveRawAtIDs_UnionFallbackAndEmailGuard(t *testing.T) {
 	want := "抄送 @云用户 和 @所有者，请联系 a@on_call.com"
 	if got := p.resolveRawAtIDs(in, mentions); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestCardLink_ExtractedFromRawAndEnvelope(t *testing.T) {
+	raw := `{"schema":"2.0","header":{"title":{"content":"T"}},
+		"card_link":{"url":"https://example.com/card"},
+		"body":{"elements":[{"tag":"markdown","content":"hi"}]}}`
+	parts, _ := extractCard2RawParts(raw, nil)
+	if len(parts) != 3 || parts[2] != "[卡片链接](https://example.com/card)" {
+		t.Fatalf("raw card_link parts = %q", parts)
+	}
+
+	env := `{"title":"T","card_link":{"pc_url":"https://example.com/pc"},
+		"elements":[[{"tag":"text","text":"hi"}]]}`
+	parts, _ = extractInteractiveReceiveParts(env)
+	if len(parts) != 3 || parts[2] != "[卡片链接](https://example.com/pc)" {
+		t.Fatalf("envelope card_link parts = %q", parts)
+	}
+
+	// No link configured: nothing appended.
+	parts, _ = extractCard2RawParts(`{"schema":"2.0","body":{"elements":[]}}`, nil)
+	if len(parts) != 0 {
+		t.Fatalf("linkless parts = %q, want empty", parts)
+	}
+}
+
+func TestCard2Button_DirectURL(t *testing.T) {
+	var parts []string
+	appendCard2Element(
+		json.RawMessage(`{"tag":"button","text":"打开","url":"https://example.com/go"}`),
+		&parts, nil, nil)
+	if len(parts) != 1 || parts[0] != "[打开](https://example.com/go)" {
+		t.Fatalf("parts = %q", parts)
 	}
 }
