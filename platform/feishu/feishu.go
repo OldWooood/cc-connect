@@ -1487,7 +1487,7 @@ func (p *Platform) onMessageRecalled(_ context.Context, event *larkim.P2MessageR
 }
 
 func isGroupHistoryMessageType(msgType string) bool {
-	return msgType == "text" || msgType == "post"
+	return msgType == "text" || msgType == "post" || msgType == "interactive"
 }
 
 // groupHistoryScope deliberately differs from makeSessionKey. With
@@ -1521,6 +1521,14 @@ func (p *Platform) historyText(msgType, content string, mentions []*larkim.Menti
 		return stripMentions(textBody.Text, mentions, p.getBotOpenID())
 	case "post":
 		return strings.TrimSpace(extractPostPlainText(content))
+	case "interactive":
+		text := strings.TrimSpace(stripMentions(extractInteractiveReceiveText(content), mentions, p.getBotOpenID()))
+		// An unparseable card degrades to the "[interactive card]" marker;
+		// keep it out of group history so it cannot crowd out real context.
+		if text == "[interactive card]" {
+			return ""
+		}
+		return text
 	default:
 		return ""
 	}
@@ -1764,7 +1772,8 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	botOpenID := p.getBotOpenID()
 	filterActive := botOpenID != "" || p.IsGroupFilterDegraded()
 	botMentioned := botOpenID != "" && isBotMentioned(msg.Mentions, botOpenID)
-	atEveryone := p.respondToAtEveryoneAndHere && msg.Content != nil && strings.Contains(*msg.Content, "@_all")
+	atEveryone := p.respondToAtEveryoneAndHere && msg.Content != nil &&
+		(strings.Contains(*msg.Content, "@_all") || strings.Contains(*msg.Content, `"user_id":"all"`))
 
 	// With history sharing enabled, observe ordinary text/post messages only
 	// after the chat-level allow list has admitted the chat. Do this before the
@@ -2102,6 +2111,23 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...), Files: postFiles,
+			ReplyCtx:          rctx,
+			UserMessageTimeMs: createTimeMs,
+		})
+
+	case "interactive":
+		textParts, images := p.parseInteractiveContent(messageID, content, mentions)
+		text := stripMentions(strings.Join(textParts, "\n"), mentions, p.getBotOpenID())
+		if text == "" && historyText == "" && len(images) == 0 && quoted.text == "" && len(quoted.images) == 0 {
+			return
+		}
+		// Flush any image batch buffered earlier in this session (#1686 P1-B).
+		p.flushImageBatchForSession(sessionKey)
+		dispatchCore(&core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName, ChatName: chatName,
+			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...),
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
@@ -2663,7 +2689,7 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 			})
 		}
 	case "interactive":
-		text = extractInteractiveCardText(content)
+		text = replaceMentions(extractInteractiveReceiveText(content), item.Mentions)
 	default:
 		text = fmt.Sprintf("[%s]", item.MsgType)
 	}
@@ -3305,6 +3331,22 @@ func (p *Platform) formatMergeForwardTree(parentID string, childrenMap map[strin
 		case "merge_forward":
 			sb.WriteString(fmt.Sprintf("%s[%s] %s: [forwarded messages]\n", indent, ts, senderName))
 			p.formatMergeForwardTree(msgID, childrenMap, nameMap, sb, images, files, depth+1)
+
+		case "interactive":
+			// Cards nested inside a merged-forward thread: same receive-format
+			// extraction as live dispatch, with images downloaded inline.
+			evolvedParts, evolvedImages := p.parseInteractiveContent(msgID, content, nil)
+			*images = append(*images, evolvedImages...)
+			evolvedText := replaceMentions(strings.Join(evolvedParts, "\n"), item.Mentions)
+			if evolvedText == "" && len(evolvedImages) > 0 {
+				evolvedText = "[image]"
+			}
+			if evolvedText != "" {
+				sb.WriteString(fmt.Sprintf("%s[%s] %s:\n", indent, ts, senderName))
+				for _, line := range strings.Split(evolvedText, "\n") {
+					sb.WriteString(fmt.Sprintf("%s    %s\n", indent, line))
+				}
+			}
 
 		default:
 			sb.WriteString(fmt.Sprintf("%s[%s] %s: [%s message]\n", indent, ts, senderName, msgType))
