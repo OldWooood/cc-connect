@@ -1644,6 +1644,13 @@ func (p *Platform) historySenderName(entry groupHistoryEntry) string {
 			return name
 		}
 	}
+	// resolveUserNameAs namespaces cache entries by ID type; check the
+	// open_id entry too so history formatting benefits from the cache.
+	if cached, ok := p.userNameCache.Load("open_id:" + entry.senderID); ok {
+		if name, ok := cached.(string); ok && name != "" {
+			return name
+		}
+	}
 	if p.client != nil {
 		if name := p.resolveUserName(entry.senderID); name != "" && name != entry.senderID {
 			return name
@@ -2116,8 +2123,25 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 		})
 
 	case "interactive":
-		textParts, images := p.parseInteractiveContent(messageID, content, mentions)
+		slog.Debug(p.tag()+": interactive raw content", "message_id", messageID, "content", truncateForLog(content, 2000))
+		var textParts []string
+		var images []core.ImageAttachment
+		usedRaw := false
+		// Card 2.0 event bodies are a lossy fallback (title + upgrade
+		// notice); prefer the original payload via user_card_content.
+		if raw := p.fetchRawCardContent(ctx, messageID); raw != "" {
+			if rp, rk := extractCard2RawParts(raw, mapMentionKeys(mentions)); len(rp) > 0 || len(rk) > 0 {
+				textParts = rp
+				images = p.downloadInteractiveImages(messageID, rk)
+				usedRaw = true
+			}
+		}
+		if !usedRaw {
+			textParts, images = p.parseInteractiveContent(messageID, content, mentions)
+		}
 		text := stripMentions(strings.Join(textParts, "\n"), mentions, p.getBotOpenID())
+		text = p.resolveRawAtIDs(text, mentions)
+		slog.Debug(p.tag()+": interactive extracted", "message_id", messageID, "text", truncateForLog(text, 2000), "images", len(images), "used_raw", usedRaw)
 		if text == "" && historyText == "" && len(images) == 0 && quoted.text == "" && len(quoted.images) == 0 {
 			return
 		}
@@ -2266,27 +2290,39 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 
 // resolveUserName fetches a user's display name via the Contact API, with caching.
 func (p *Platform) resolveUserName(openID string) string {
-	if !isValidFeishuLookupID(openID) {
-		return openID
+	return p.resolveUserNameAs(openID, "open_id")
+}
+
+// resolveUserNameAs resolves any documented user-ID form by explicitly
+// naming its user_id_type (open_id, union_id, user_id). Cache entries are
+// namespaced by type.
+func (p *Platform) resolveUserNameAs(userID, userIDType string) string {
+	if !isValidFeishuLookupID(userID) {
+		return userID
 	}
-	if cached, ok := p.userNameCache.Load(openID); ok {
+	cacheKey := userIDType + ":" + userID
+	if cached, ok := p.userNameCache.Load(cacheKey); ok {
+		return cached.(string)
+	}
+	// Backward-compatible: entries cached by resolveUserName before typing.
+	if cached, ok := p.userNameCache.Load(userID); ok && userIDType == "open_id" {
 		return cached.(string)
 	}
 	resp, err := p.client.Contact.User.Get(context.Background(),
 		larkcontact.NewGetUserReqBuilder().
-			UserId(openID).
-			UserIdType("open_id").
+			UserId(userID).
+			UserIdType(userIDType).
 			Build())
 	if err != nil {
-		slog.Debug(p.tag()+": resolve user name failed", "open_id", openID, "error", err)
-		return openID
+		slog.Debug(p.tag()+": resolve user name failed", "user_id", userID, "user_id_type", userIDType, "error", err)
+		return userID
 	}
 	if !resp.Success() || resp.Data == nil || resp.Data.User == nil || resp.Data.User.Name == nil {
-		slog.Debug(p.tag()+": resolve user name: no data", "open_id", openID, "code", resp.Code)
-		return openID
+		slog.Debug(p.tag()+": resolve user name: no data", "user_id", userID, "user_id_type", userIDType, "code", resp.Code)
+		return userID
 	}
 	name := *resp.Data.User.Name
-	p.userNameCache.Store(openID, name)
+	p.userNameCache.Store(cacheKey, name)
 	return name
 }
 
@@ -2689,7 +2725,11 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 			})
 		}
 	case "interactive":
-		text = replaceMentions(extractInteractiveReceiveText(content), item.Mentions)
+		if rp, _ := extractCard2RawParts(content, mapAPIMentionKeys(item.Mentions)); len(rp) > 0 {
+			text = replaceMentions(strings.Join(rp, "\n"), item.Mentions)
+		} else {
+			text = replaceMentions(extractInteractiveReceiveText(content), item.Mentions)
+		}
 	default:
 		text = fmt.Sprintf("[%s]", item.MsgType)
 	}
@@ -2893,6 +2933,19 @@ func extractPostPlainText(content string) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// truncateForLog cuts s to at most n runes for log output, so a large card
+// body cannot flood the log. Multibyte-safe.
+func truncateForLog(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "..."
 }
 
 // extractInteractiveCardText extracts readable text from a Feishu interactive card JSON.
@@ -3337,7 +3390,7 @@ func (p *Platform) formatMergeForwardTree(parentID string, childrenMap map[strin
 			// extraction as live dispatch, with images downloaded inline.
 			evolvedParts, evolvedImages := p.parseInteractiveContent(msgID, content, nil)
 			*images = append(*images, evolvedImages...)
-			evolvedText := replaceMentions(strings.Join(evolvedParts, "\n"), item.Mentions)
+			evolvedText := p.resolveRawAtIDs(replaceMentions(strings.Join(evolvedParts, "\n"), item.Mentions), nil)
 			if evolvedText == "" && len(evolvedImages) > 0 {
 				evolvedText = "[image]"
 			}

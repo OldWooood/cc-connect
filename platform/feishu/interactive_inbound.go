@@ -1,13 +1,17 @@
 package feishu
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/chenhg5/cc-connect/core"
 
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -228,6 +232,41 @@ func extractInteractiveReceiveText(content string) string {
 	return strings.Join(parts, "\n")
 }
 
+// fetchRawCardContent returns a card message's original payload via the
+// documented user_card_content parameter (Card 1.0 original JSON, or the
+// Card 2.0 original with schema/body/header). The default event/API body
+// for 2.0 cards is a lossy fallback (title + upgrade notice + placeholder
+// image on clients < 7.20), so live dispatch prefers this source and only
+// falls back to the event body when the fetch fails. Returns "" on any
+// failure; callers must fall back rather than drop the turn.
+func (p *Platform) fetchRawCardContent(ctx context.Context, messageID string) string {
+	if strings.TrimSpace(messageID) == "" || p.client == nil {
+		return ""
+	}
+	apiPath := fmt.Sprintf("/open-apis/im/v1/messages/%s?card_msg_content_type=user_card_content", messageID)
+	apiResp, err := p.client.Get(ctx, apiPath, nil, larkcore.AccessTokenTypeTenant)
+	if err != nil {
+		slog.Debug(p.tag()+": fetch raw card failed", "message_id", messageID, "error", err)
+		return ""
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Items []struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(apiResp.RawBody, &resp); err != nil || resp.Code != 0 ||
+		len(resp.Data.Items) == 0 || resp.Data.Items[0].Body.Content == "" {
+		slog.Debug(p.tag()+": fetch raw card: empty or error payload", "message_id", messageID)
+		return ""
+	}
+	return resp.Data.Items[0].Body.Content
+}
+
 // downloadInteractiveImages fetches card image_keys best-effort: a failed
 // image is logged and skipped so one expired image_key does not drop the
 // whole card turn.
@@ -261,4 +300,479 @@ func (p *Platform) parseInteractiveContent(messageID, raw string, mentions []*la
 		return nil, nil
 	}
 	return parts, p.downloadInteractiveImages(messageID, imageKeys)
+}
+
+// mapMentionKeys indexes event mentions by every user ID form so Card 2.0
+// raw payloads (which carry real open_ids, not @_user_N placeholders) can
+// be rewritten into the placeholder space stripMentions understands.
+func mapMentionKeys(mentions []*larkim.MentionEvent) map[string]string {
+	out := make(map[string]string)
+	for _, m := range mentions {
+		if m == nil || m.Key == nil || *m.Key == "" || m.Id == nil {
+			continue
+		}
+		for _, id := range []string{
+			stringValue2(m.Id.OpenId), stringValue2(m.Id.UserId), stringValue2(m.Id.UnionId),
+		} {
+			if id != "" {
+				out[id] = *m.Key
+			}
+		}
+	}
+	return out
+}
+
+// mapAPIMentionKeys is mapMentionKeys for the API-shape mentions
+// ([]*larkim.Mention, plain open_id in Id) found on Get-message responses.
+func mapAPIMentionKeys(mentions []*larkim.Mention) map[string]string {
+	out := make(map[string]string)
+	for _, m := range mentions {
+		if m == nil || m.Key == nil || *m.Key == "" || m.Id == nil || *m.Id == "" {
+			continue
+		}
+		out[*m.Id] = *m.Key
+	}
+	return out
+}
+
+func stringValue2(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// Card 2.0 raw-DSL element. Field names cover both the raw json_card /
+// user_card_content serialization (camelCase under property) and the
+// send-style schema 2.0 (snake_case); encoding/json matches keys
+// case-insensitively, and genuinely different spellings get both fields.
+type card2Element struct {
+	Tag         string            `json:"tag"`
+	Text        string            `json:"text"`
+	Content     string            `json:"content"`
+	Href        string            `json:"href"`
+	UserID      string            `json:"user_id"`
+	UserName    string            `json:"user_name"`
+	ImageKey    string            `json:"image_key"`
+	Placeholder string            `json:"placeholder"`
+	Level       int               `json:"level"`
+	Property    card2Property     `json:"property"`
+	Elements    []json.RawMessage `json:"elements"`
+	// Flat-serialization containers mount children directly (no property
+	// wrapper); see user_card_content for Card 2.0 originals.
+	Columns []json.RawMessage `json:"columns"`
+	Rows    json.RawMessage   `json:"rows"`
+}
+
+// card2Property is the component payload of a Card 2.0 raw-DSL element.
+type card2Property struct {
+	Content   string            `json:"content"`
+	ImageKey  string            `json:"image_key"`
+	ImageKeyC string            `json:"imageKey"`
+	UserID    string            `json:"userID"`
+	Level     int               `json:"level"`
+	Elements  []json.RawMessage `json:"elements"`
+	Columns   []json.RawMessage `json:"columns"`
+	Rows      json.RawMessage   `json:"rows"`
+	Text      json.RawMessage   `json:"text"`
+	Behaviors json.RawMessage   `json:"behaviors"`
+}
+
+// appendCard2Element renders one Card 2.0 raw-DSL component. At mentions
+// carry real user IDs, so they are rewritten to @_user_N placeholders via
+// keyMap (built from the event mentions) for stripMentions downstream.
+func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]string, keyMap map[string]string) {
+	var elem card2Element
+	if err := json.Unmarshal(raw, &elem); err != nil {
+		return
+	}
+	prop := elem.Property
+	switch elem.Tag {
+	case "plain_text", "text":
+		if c := firstNonEmpty(prop.Content, elem.Content, elem.Text); c != "" {
+			*parts = append(*parts, cleanCard2Text(c, keyMap))
+		}
+	case "heading":
+		var inner []string
+		for _, nested := range prop.Elements {
+			var tmp []string
+			appendCard2Element(nested, &tmp, imageKeys, keyMap)
+			inner = append(inner, tmp...)
+		}
+		text := strings.Join(inner, "")
+		if text == "" {
+			text = firstNonEmpty(prop.Content, elem.Content)
+		}
+		if text == "" {
+			return
+		}
+		if prop.Level >= 1 && prop.Level <= 6 {
+			text = strings.Repeat("#", prop.Level) + " " + text
+		}
+		*parts = append(*parts, text)
+	case "markdown":
+		if len(prop.Elements) > 0 {
+			for _, nested := range prop.Elements {
+				appendCard2Element(nested, parts, imageKeys, keyMap)
+			}
+			return
+		}
+		if c := firstNonEmpty(prop.Content, elem.Content, elem.Text); c != "" {
+			*parts = append(*parts, cleanCard2Text(c, keyMap))
+		}
+	case "a":
+		switch t, h := cleanCard2Text(firstNonEmpty(prop.Content, elem.Text), keyMap), elem.Href; {
+		case t != "" && h != "":
+			*parts = append(*parts, fmt.Sprintf("[%s](%s)", t, h))
+		case t != "":
+			*parts = append(*parts, t)
+		case h != "":
+			*parts = append(*parts, h)
+		}
+	case "at":
+		uid := firstNonEmpty(prop.UserID, elem.UserID)
+		switch {
+		case uid == "all":
+			*parts = append(*parts, "@all")
+		case uid != "":
+			if key, ok := keyMap[uid]; ok {
+				*parts = append(*parts, key)
+			} else {
+				*parts = append(*parts, "@"+uid)
+			}
+		case elem.UserName != "":
+			*parts = append(*parts, "@"+elem.UserName)
+		}
+	case "column_set":
+		cols := prop.Columns
+		if len(cols) == 0 {
+			cols = elem.Columns
+		}
+		for _, col := range cols {
+			appendCard2Element(col, parts, imageKeys, keyMap)
+		}
+	case "column":
+		nested := prop.Elements
+		if len(nested) == 0 {
+			nested = elem.Elements
+		}
+		for _, el := range nested {
+			appendCard2Element(el, parts, imageKeys, keyMap)
+		}
+	case "table":
+		colsRaw := mustMarshal(prop.Columns)
+		if string(colsRaw) == "null" || string(colsRaw) == "[]" {
+			colsRaw = mustMarshal(elem.Columns)
+		}
+		rowsRaw := prop.Rows
+		if len(rowsRaw) == 0 {
+			rowsRaw = elem.Rows
+		}
+		appendCard2Table(colsRaw, rowsRaw, parts, keyMap)
+	case "img", "image":
+		if k := firstNonEmpty(elem.ImageKey, prop.ImageKey, prop.ImageKeyC); k != "" {
+			*imageKeys = append(*imageKeys, k)
+		}
+	case "button", "action":
+		label := prop.Content
+		if label == "" && len(prop.Text) > 0 {
+			var tmp []string
+			appendCard2Element(prop.Text, &tmp, imageKeys, keyMap)
+			label = strings.Join(tmp, "")
+		}
+		if label == "" {
+			label = firstNonEmpty(elem.Content, elem.Text)
+		}
+		openURL := ""
+		if len(prop.Behaviors) > 0 {
+			var behaviors []struct {
+				Type string `json:"type"`
+				URL  string `json:"url"`
+			}
+			if json.Unmarshal(prop.Behaviors, &behaviors) == nil {
+				for _, b := range behaviors {
+					if (b.Type == "open_url" || b.Type == "openUrl") && b.URL != "" {
+						openURL = b.URL
+						break
+					}
+				}
+			}
+		}
+		switch {
+		case label != "" && openURL != "":
+			*parts = append(*parts, fmt.Sprintf("[%s](%s)", label, openURL))
+		case label != "":
+			*parts = append(*parts, label)
+		}
+	case "divider", "hr":
+		*parts = append(*parts, "---")
+	case "card_header", "ud_icon", "icon":
+		// Decorative only; the header title is extracted at the top level.
+	default:
+		// Unknown or container tags (form, chart, note, body, ...): descend
+		// into nested element lists so new component kinds degrade to
+		// partial text instead of silence.
+		for _, nested := range prop.Elements {
+			appendCard2Element(nested, parts, imageKeys, keyMap)
+		}
+		for _, col := range prop.Columns {
+			appendCard2Element(col, parts, imageKeys, keyMap)
+		}
+		if len(prop.Text) > 0 {
+			appendCard2Element(prop.Text, parts, imageKeys, keyMap)
+		}
+		for _, nested := range elem.Elements {
+			appendCard2Element(nested, parts, imageKeys, keyMap)
+		}
+		if c := firstNonEmpty(prop.Content, elem.Content, elem.Text); c != "" &&
+			len(prop.Elements) == 0 && len(prop.Columns) == 0 && len(prop.Text) == 0 && len(elem.Elements) == 0 {
+			*parts = append(*parts, c)
+		}
+	}
+}
+
+// Card 2.0 markdown mention syntax: <at id="ou_xxx">name</at>. Rewritten to
+// @_user_N placeholders (via keyMap) so stripMentions resolves names and
+// drops the bot token downstream.
+var card2AtRe = regexp.MustCompile(`(?i)<at\s+id\s*=\s*"?([^"\s>]+)"?[^>]*>(.*?)</at>`)
+
+// Fallback @-IDs that never entered the placeholder space (raw open_ids
+// with no event mention entry), resolved to display names best-effort.
+// Covers the documented user-ID prefixes (ou_ = open_id, on_ = union_id);
+// a trailing ".domain" forces email treatment so "a@on_call.com" is never
+// rewritten. Bare user_id (employee_id) has no distinguishable prefix and
+// can only resolve through the mention list, never this regex.
+var card2RawAtRe = regexp.MustCompile(`@((?:ou|on)_[A-Za-z0-9_]+)(\.[A-Za-z0-9.-]*)?`)
+
+// Lightweight formatting tags kept as plain text (inner content preserved).
+var card2BrRe = regexp.MustCompile(`(?i)<br\s*/?>`)
+var card2FmtRe = regexp.MustCompile(`(?i)</?(font|b|strong|i|em|u|s|strike|del|span|div)(\s[^>]*)?>`)
+
+// cleanCard2Text normalizes Card 2.0 rich-text content for the agent:
+// inline <at> mentions become resolvable tokens, presentational tags are
+// stripped but their inner text is kept.
+func cleanCard2Text(s string, keyMap map[string]string) string {
+	s = card2AtRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := card2AtRe.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return m
+		}
+		uid := sub[1]
+		if uid == "all" {
+			return "@all"
+		}
+		if key, ok := keyMap[uid]; ok {
+			return key
+		}
+		return "@" + uid
+	})
+	s = card2BrRe.ReplaceAllString(s, "\n")
+	return card2FmtRe.ReplaceAllString(s, "")
+}
+
+// resolveRawAtIDs rewrites leftover "@ou_xxx" tokens (card @-mentions with
+// no event mention entry, so stripMentions could not resolve them) to
+// "@name" via the mention list first and the contact API second. Unknown
+// IDs are left verbatim so no information is lost.
+func (p *Platform) resolveRawAtIDs(text string, mentions []*larkim.MentionEvent) string {
+	if !card2RawAtRe.MatchString(text) {
+		return text
+	}
+	nameByID := make(map[string]string)
+	for _, m := range mentions {
+		if m == nil || m.Id == nil || m.Name == nil || *m.Name == "" {
+			continue
+		}
+		for _, id := range []string{stringValue2(m.Id.OpenId), stringValue2(m.Id.UserId), stringValue2(m.Id.UnionId)} {
+			if id != "" {
+				nameByID[id] = *m.Name
+			}
+		}
+	}
+	return card2RawAtRe.ReplaceAllStringFunc(text, func(token string) string {
+		sub := card2RawAtRe.FindStringSubmatch(token)
+		if len(sub) < 2 {
+			return token
+		}
+		if sub[2] != "" {
+			return token // email-like, leave untouched
+		}
+		id := sub[1]
+		if name, ok := nameByID[id]; ok {
+			return "@" + name
+		}
+		if p.client == nil {
+			return token
+		}
+		if resolved := p.resolveUserName(id); resolved != id {
+			return "@" + resolved
+		}
+		// union_id is only resolvable under its own user_id_type.
+		if strings.HasPrefix(id, "on_") {
+			if resolved := p.resolveUserNameAs(id, "union_id"); resolved != id {
+				return "@" + resolved
+			}
+		}
+		return token
+	})
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// appendCard2Table renders a Card 2.0 raw-DSL table as a markdown table.
+// Unlike the send-style table (whose cells hold element objects), raw-DSL
+// cells usually hold plain strings ({"col": {"data": "..."}}); element
+// objects are still supported via the generic walker. Column headers accept
+// both displayName (nested DSL) and display_name (flat DSL).
+func appendCard2Table(columnsRaw, rowsRaw json.RawMessage, parts *[]string, keyMap map[string]string) {
+	var columns []struct {
+		DisplayName  string `json:"displayName"`
+		DisplayName2 string `json:"display_name"`
+		Name         string `json:"name"`
+	}
+	if err := json.Unmarshal(columnsRaw, &columns); err != nil || len(columns) == 0 {
+		return
+	}
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(rowsRaw, &rows); err != nil {
+		return
+	}
+	header := make([]string, len(columns))
+	for i, col := range columns {
+		header[i] = firstNonEmpty(col.DisplayName, col.DisplayName2, col.Name)
+	}
+	*parts = append(*parts, "| "+strings.Join(header, " | ")+" |")
+	sep := make([]string, len(columns))
+	for i := range sep {
+		sep[i] = "---"
+	}
+	*parts = append(*parts, "| "+strings.Join(sep, " | ")+" |")
+	for _, row := range rows {
+		cells := make([]string, len(columns))
+		for i, col := range columns {
+			cell := row[col.Name]
+			// Nested DSL wraps values ({"col": {"data": "..."}}); flat
+			// DSL stores them bare ({"col": "..."}).
+			var wrapped struct {
+				Data json.RawMessage `json:"data"`
+			}
+			if json.Unmarshal(cell, &wrapped) == nil && len(wrapped.Data) > 0 {
+				cell = wrapped.Data
+			}
+			var s string
+			if json.Unmarshal(cell, &s) == nil {
+				cells[i] = cleanCard2Text(s, keyMap)
+				continue
+			}
+			var num float64
+			if json.Unmarshal(cell, &num) == nil {
+				cells[i] = strconv.FormatFloat(num, 'f', -1, 64)
+				continue
+			}
+			var cellParts []string
+			appendCard2Element(cell, &cellParts, nil, keyMap)
+			cells[i] = strings.Join(cellParts, " ")
+		}
+		*parts = append(*parts, "| "+strings.Join(cells, " | ")+" |")
+	}
+}
+
+func mustMarshal(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// extractCard2RawParts parses a Card 2.0 original payload: either the direct
+// card JSON (user_card_content) or the {"json_card": "..."} wrapper
+// (raw_card_content). Returns nil when the input is not a 2.0 card so the
+// caller can fall back to the receive-format / legacy parsers.
+func extractCard2RawParts(cardJSON string, keyMap map[string]string) (parts []string, imageKeys []string) {
+	raw := cardJSON
+	var wrapper struct {
+		JsonCard string `json:"json_card"`
+	}
+	if json.Unmarshal([]byte(cardJSON), &wrapper) == nil && wrapper.JsonCard != "" {
+		raw = wrapper.JsonCard
+	}
+	var card map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &card); err != nil {
+		return nil, nil
+	}
+	// Raw originals always carry body and/or schema. The lossy
+	// receive-format envelope ({title, elements}) carries neither: it must
+	// fall through to the receive-format parser, which understands it.
+	if _, ok := card["body"]; !ok {
+		if _, ok := card["schema"]; !ok {
+			return nil, nil
+		}
+	}
+
+	// Header title (raw DSL nests it under property.title).
+	if h, ok := card["header"]; ok {
+		var header struct {
+			Property struct {
+				Title struct {
+					Property struct {
+						Content string `json:"content"`
+					} `json:"property"`
+					Content string `json:"content"`
+				} `json:"title"`
+			} `json:"property"`
+			Title struct {
+				Content string `json:"content"`
+			} `json:"title"`
+		}
+		if json.Unmarshal(h, &header) == nil {
+			if c := firstNonEmpty(header.Property.Title.Property.Content, header.Property.Title.Content, header.Title.Content); c != "" {
+				parts = append(parts, c)
+			}
+		}
+	}
+	// Legacy flat title (Card 1.0 originals served via the same parameter).
+	if len(parts) == 0 {
+		if t, ok := card["title"]; ok {
+			var title string
+			if json.Unmarshal(t, &title) == nil && title != "" {
+				parts = append(parts, title)
+			}
+		}
+	}
+
+	body, ok := card["body"]
+	if !ok {
+		if len(parts) == 0 {
+			return nil, nil
+		}
+		return parts, imageKeys
+	}
+	// body may be a component ({tag, property.elements}) or bare elements.
+	var bodyElem card2Element
+	if json.Unmarshal(body, &bodyElem) != nil {
+		if len(parts) == 0 {
+			return nil, nil
+		}
+		return parts, imageKeys
+	}
+	if len(bodyElem.Property.Elements) > 0 {
+		for _, el := range bodyElem.Property.Elements {
+			appendCard2Element(el, &parts, &imageKeys, keyMap)
+		}
+	} else if len(bodyElem.Elements) > 0 {
+		for _, el := range bodyElem.Elements {
+			appendCard2Element(el, &parts, &imageKeys, keyMap)
+		}
+	} else {
+		appendCard2Element(body, &parts, &imageKeys, keyMap)
+	}
+	if len(parts) == 0 && len(imageKeys) == 0 {
+		return nil, nil
+	}
+	return parts, imageKeys
 }
