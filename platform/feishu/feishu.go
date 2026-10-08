@@ -3342,9 +3342,9 @@ func (p *Platform) formatMergeForwardTree(parentID string, childrenMap map[strin
 				evolvedText = "[image]"
 			}
 			if evolvedText != "" {
-				sb.WriteString(fmt.Sprintf("%s[%s] %s:\n", indent, ts, senderName))
+				fmt.Fprintf(sb, "%s[%s] %s:\n", indent, ts, senderName)
 				for _, line := range strings.Split(evolvedText, "\n") {
-					sb.WriteString(fmt.Sprintf("%s    %s\n", indent, line))
+					fmt.Fprintf(sb, "%s    %s\n", indent, line)
 				}
 			}
 
