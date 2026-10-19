@@ -200,11 +200,20 @@ func (cs *codexSession) stageImages(prompt string, images []core.ImageAttachment
 	}
 
 	imagePaths := make([]string, 0, len(images))
-	for i, img := range images {
+	for _, img := range images {
 		ext := codexImageExt(img.MimeType)
-		fname := fmt.Sprintf("img_%d_%d%s", time.Now().UnixMilli(), i, ext)
-		fpath := filepath.Join(imgDir, fname)
-		if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
+		// Sessions share imgDir, so reserve a unique path before writing.
+		file, err := os.CreateTemp(imgDir, "img_*"+ext)
+		if err != nil {
+			return "", nil, fmt.Errorf("codexSession: create image: %w", err)
+		}
+		fpath := file.Name()
+		_, writeErr := file.Write(img.Data)
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			if removeErr := os.Remove(fpath); removeErr != nil {
+				slog.Warn("codexSession: remove incomplete image", "path", fpath, "error", removeErr)
+			}
 			return "", nil, fmt.Errorf("codexSession: save image: %w", err)
 		}
 		imagePaths = append(imagePaths, fpath)

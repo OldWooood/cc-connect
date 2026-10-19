@@ -20,6 +20,15 @@ import (
 
 type stubAgent struct{}
 
+type failingHistoryAgent struct {
+	stubAgent
+	err error
+}
+
+func (a *failingHistoryAgent) GetSessionHistory(context.Context, string, int) ([]HistoryEntry, error) {
+	return []HistoryEntry{{Role: "user", Content: "partial history"}}, a.err
+}
+
 func (a *stubAgent) Name() string { return "stub" }
 func (a *stubAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
 	return &stubAgentSession{}, nil
@@ -3827,6 +3836,33 @@ func TestCmdCurrent_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	}
 	if strings.Contains(p.sent[0], "cc-connect") {
 		t.Fatalf("current text = %q, should not be card fallback title", p.sent[0])
+	}
+}
+
+func TestCmdHistory_ReadFailureIsVisibleWithoutLeakingPath(t *testing.T) {
+	const secretPath = "/private/codex-home/sessions/secret.jsonl"
+	agent := &failingHistoryAgent{err: fmt.Errorf("scan %s: token too long", secretPath)}
+	msg := &Message{SessionKey: "test:history-failure", ReplyCtx: "ctx"}
+
+	plain := &stubPlatformEngine{n: "plain"}
+	textEngine := NewEngine("test", agent, []Platform{plain}, "", LangEnglish)
+	textEngine.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("broken", "test")
+	textEngine.cmdHistory(plain, msg, []string{"10"})
+	sent := plain.getSent()
+	if len(sent) != 1 || sent[0] != textEngine.i18n.T(MsgHistoryReadFailed) || strings.Contains(sent[0], secretPath) {
+		t.Fatalf("text history response = %q; want generic localized failure without path", sent)
+	}
+
+	cardPlatform := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "cards"}}
+	cardEngine := NewEngine("test", agent, []Platform{cardPlatform}, "", LangEnglish)
+	cardEngine.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("broken", "test")
+	cardEngine.cmdHistory(cardPlatform, msg, nil)
+	if len(cardPlatform.repliedCards) != 1 {
+		t.Fatalf("card replies = %d, want 1", len(cardPlatform.repliedCards))
+	}
+	cardText := cardPlatform.repliedCards[0].RenderText()
+	if !strings.Contains(cardText, cardEngine.i18n.T(MsgHistoryReadFailed)) || strings.Contains(cardText, secretPath) || strings.Contains(cardText, "partial history") {
+		t.Fatalf("card history response = %q; want generic localized failure without path or partial history", cardText)
 	}
 }
 
@@ -9730,6 +9766,48 @@ func TestExecuteCardAction_ModeCleansUpWithInteractiveKey(t *testing.T) {
 	e.interactiveMu.Unlock()
 	if exists {
 		t.Error("expected interactive state to be cleaned up after /mode")
+	}
+}
+
+// Regression: the /list card button reaches executeCardAction, which cleared the
+// session history after switching. cmdSwitch never did, and documents why —
+// SwitchToAgentSession returns the existing Session when the agent session ID is
+// known, so wiping History makes /status and /history report zero messages right
+// after a switch that succeeded. Typing "/switch 1" kept its history; tapping the
+// same session in the card did not.
+func TestExecuteCardAction_SwitchPreservesHistory(t *testing.T) {
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	agent := &stubListAgent{sessions: []AgentSessionInfo{
+		{ID: "sess-a1", Summary: "a1"},
+		{ID: "sess-a2", Summary: "a2"},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "feishu:channel1:user1"
+	sessions := e.sessions
+
+	// A session with recorded history, then a second session that became active —
+	// the state a /list card switch encounters.
+	first := sessions.GetOrCreateActive(sessionKey)
+	first.SetAgentSessionID("sess-a1", "stub")
+	first.AddHistory("user", "A1 first message")
+	first.AddHistory("assistant", "A1 reply")
+	sessions.Save()
+
+	sessions.NewSession(sessionKey, "a2")
+	sessions.GetOrCreateActive(sessionKey).SetAgentSessionID("sess-a2", "stub")
+	sessions.Save()
+
+	// "act:/switch 1" is what a /list card row sends.
+	_ = e.handleCardNav("act:/switch 1", sessionKey)
+
+	active := sessions.GetOrCreateActive(sessionKey)
+	if active.GetAgentSessionID() != "sess-a1" {
+		t.Fatalf("active session after card /switch = %q, want sess-a1", active.GetAgentSessionID())
+	}
+	hist := active.GetHistory(10)
+	if len(hist) == 0 || !strings.Contains(hist[0].Content, "A1") {
+		t.Fatalf("history after card /switch = %v, want the A1 conversation preserved", hist)
 	}
 }
 
