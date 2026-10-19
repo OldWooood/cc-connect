@@ -463,15 +463,15 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 			appendCard2Element(el, parts, imageKeys, keyMap)
 		}
 	case "table":
-		colsRaw := mustMarshal(prop.Columns)
-		if string(colsRaw) == "null" || string(colsRaw) == "[]" {
-			colsRaw = mustMarshal(elem.Columns)
+		cols := prop.Columns
+		if len(cols) == 0 {
+			cols = elem.Columns
 		}
 		rowsRaw := prop.Rows
 		if len(rowsRaw) == 0 {
 			rowsRaw = elem.Rows
 		}
-		appendCard2Table(colsRaw, rowsRaw, parts, keyMap)
+		appendCard2Table(cols, rowsRaw, parts, keyMap)
 	case "img", "image":
 		if k := firstNonEmpty(elem.ImageKey, prop.ImageKey, prop.ImageKeyC); k != "" {
 			*imageKeys = append(*imageKeys, k)
@@ -636,13 +636,20 @@ func firstNonEmpty(vals ...string) string {
 // cells usually hold plain strings ({"col": {"data": "..."}}); element
 // objects are still supported via the generic walker. Column headers accept
 // both displayName (nested DSL) and display_name (flat DSL).
-func appendCard2Table(columnsRaw, rowsRaw json.RawMessage, parts *[]string, keyMap map[string]string) {
-	var columns []struct {
+func appendCard2Table(columnRaws []json.RawMessage, rowsRaw json.RawMessage, parts *[]string, keyMap map[string]string) {
+	type column struct {
 		DisplayName  string `json:"displayName"`
 		DisplayName2 string `json:"display_name"`
 		Name         string `json:"name"`
 	}
-	if err := json.Unmarshal(columnsRaw, &columns); err != nil || len(columns) == 0 {
+	columns := make([]column, 0, len(columnRaws))
+	for _, raw := range columnRaws {
+		var col column
+		if json.Unmarshal(raw, &col) == nil {
+			columns = append(columns, col)
+		}
+	}
+	if len(columns) == 0 {
 		return
 	}
 	var rows []map[string]json.RawMessage
@@ -687,11 +694,6 @@ func appendCard2Table(columnsRaw, rowsRaw json.RawMessage, parts *[]string, keyM
 		}
 		*parts = append(*parts, "| "+strings.Join(cells, " | ")+" |")
 	}
-}
-
-func mustMarshal(v any) []byte {
-	b, _ := json.Marshal(v)
-	return b
 }
 
 // appendCardLink extracts the whole-card jump link (card_link.url, with

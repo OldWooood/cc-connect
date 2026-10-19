@@ -481,6 +481,93 @@ func TestDispatchMessageInteractiveRawCard(t *testing.T) {
 	}
 }
 
+// TestDispatchMessageInteractiveRawEmptyFallsBack covers the corner case
+// where the user_card_content fetch succeeds but yields no usable parts
+// (e.g. a schema-only payload): dispatch must fall back to the receive-format
+// event body instead of dropping the turn.
+func TestDispatchMessageInteractiveRawEmptyFallsBack(t *testing.T) {
+	const appID = "cli_interactive_raw_empty"
+	const appSecret = "secret-interactive-raw-empty"
+	const messageID = "om_interactive_raw_empty"
+
+	got := make(chan *core.Message, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "tenant-token",
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages/"+messageID &&
+			r.URL.Query().Get("card_msg_content_type") == "user_card_content":
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{
+					"items": []any{
+						map[string]any{"body": map[string]any{"content": `{"schema":"2.0"}`}},
+					},
+				},
+			})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		default:
+			t.Fatalf("unexpected path %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		platformName:         "feishu",
+		domain:               srv.URL,
+		appID:                appID,
+		appSecret:            appSecret,
+		botOpenID:            testInteractiveBotID,
+		resourceDownloadHTTP: srv.Client(),
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+		handler: func(_ core.Platform, msg *core.Message) {
+			got <- msg
+		},
+	}
+
+	content := `{"title":"回退标题","elements":[[{"tag":"text","text":"事件体内容"}]]}`
+	p.dispatchMessage(
+		context.Background(),
+		"interactive",
+		content,
+		nil,
+		messageID,
+		"feishu:oc_chat:ou_user",
+		"",
+		"",
+		replyContext{messageID: messageID, sessionKey: "feishu:oc_chat:ou_user"},
+		"",
+		0,
+	)
+
+	select {
+	case msg := <-got:
+		for _, want := range []string{"回退标题", "事件体内容"} {
+			if !strings.Contains(msg.Content, want) {
+				t.Fatalf("content %q missing fallback text %q", msg.Content, want)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected dispatch to fall back to the event body")
+	}
+}
+
 // TestOnMessage_InteractiveGroupMention verifies the full inbound path for
 // cards in group chats: @bot cards reach the handler, unmentioned cards do
 // not (same contract as text messages).
