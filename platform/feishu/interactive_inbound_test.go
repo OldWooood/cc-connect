@@ -798,3 +798,68 @@ func TestCard2Button_DirectURL(t *testing.T) {
 		t.Fatalf("parts = %q", parts)
 	}
 }
+
+// user_card_content serializes a Card 2.0 button flat: "text" is a
+// plain_text object, not a string, and the link sits on the element.
+func TestCard2Button_FlatTextObject(t *testing.T) {
+	var parts []string
+	appendCard2Element(
+		json.RawMessage(`{"element_id":"_4","tag":"button","text":{"content":"查看 Issue","tag":"plain_text"},"type":"primary","url":"https://example.com/issue/1"}`),
+		&parts, nil, nil)
+	if len(parts) != 1 || parts[0] != "[查看 Issue](https://example.com/issue/1)" {
+		t.Fatalf("parts = %q", parts)
+	}
+}
+
+func TestCard2Button_BehaviorDefaultURL(t *testing.T) {
+	var parts []string
+	appendCard2Element(
+		json.RawMessage(`{"tag":"button","text":{"tag":"plain_text","content":"打开"},"behaviors":[{"type":"open_url","default_url":"https://example.com/go"}]}`),
+		&parts, nil, nil)
+	if len(parts) != 1 || parts[0] != "[打开](https://example.com/go)" {
+		t.Fatalf("parts = %q", parts)
+	}
+}
+
+func TestExtractCard2RawParts_FlatTextObjectKeepsSiblings(t *testing.T) {
+	parts, _ := extractCard2RawParts(`{"schema":"2.0","body":{"elements":[
+		{"tag":"markdown","content":"编号 CARD-1"},
+		{"tag":"div","text":{"tag":"lark_md","content":"场景说明"}},
+		{"tag":"button","text":{"tag":"plain_text","content":"查看"},"url":"https://example.com/c/1"}]}}`, nil)
+	got := strings.Join(parts, "\n")
+	for _, want := range []string{"编号 CARD-1", "场景说明", "[查看](https://example.com/c/1)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("parts = %q, missing %q", parts, want)
+		}
+	}
+}
+
+// An img inside a table cell is rendered without an image sink (nil
+// imageKeys); it must not panic the dispatch goroutine.
+func TestExtractCard2RawParts_TableCellImageNoPanic(t *testing.T) {
+	card := `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"表格前"},{"tag":"table","columns":[{"name":"c","display_name":"C"}],"rows":[{"c":{"data":{"tag":"img","image_key":"img_v3_x"}}}]}]}}`
+	parts, _ := extractCard2RawParts(card, nil)
+	if !strings.Contains(strings.Join(parts, "\n"), "表格前") {
+		t.Fatalf("parts = %q", parts)
+	}
+}
+
+// A field with an unexpected JSON type (markdown's object-valued href for
+// per-platform links) must not drop the whole element.
+func TestExtractCard2RawParts_ObjectHrefKeepsMarkdown(t *testing.T) {
+	card := `{"schema":"2.0","header":{"title":{"tag":"plain_text","content":"Issue 123"}},"body":{"elements":[{"tag":"markdown","content":"问题详情 [QSim]($urlVal)","href":{"urlVal":{"url":"https://example.com/x"}}}]}}`
+	parts, _ := extractCard2RawParts(card, nil)
+	if !strings.Contains(strings.Join(parts, "\n"), "问题详情") {
+		t.Fatalf("parts = %q, markdown body dropped", parts)
+	}
+}
+
+// More generally, a type mismatch on any one field must keep the fields that
+// did decode (json.Unmarshal fills them before reporting the type error).
+func TestExtractCard2RawParts_TypeMismatchKeepsElement(t *testing.T) {
+	card := `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"保留正文","level":"high"}]}}`
+	parts, _ := extractCard2RawParts(card, nil)
+	if !strings.Contains(strings.Join(parts, "\n"), "保留正文") {
+		t.Fatalf("parts = %q, element dropped on type mismatch", parts)
+	}
+}

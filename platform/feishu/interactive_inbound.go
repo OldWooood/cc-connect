@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -349,22 +350,44 @@ func stringValue2(s *string) string {
 // send-style schema 2.0 (snake_case); encoding/json matches keys
 // case-insensitively, and genuinely different spellings get both fields.
 type card2Element struct {
-	Tag         string            `json:"tag"`
-	Text        string            `json:"text"`
-	Content     string            `json:"content"`
-	Href        string            `json:"href"`
-	UserID      string            `json:"user_id"`
-	UserName    string            `json:"user_name"`
-	ImageKey    string            `json:"image_key"`
-	Placeholder string            `json:"placeholder"`
-	URL         string            `json:"url"`
-	Level       int               `json:"level"`
-	Property    card2Property     `json:"property"`
-	Elements    []json.RawMessage `json:"elements"`
+	Tag       string            `json:"tag"`
+	Text      card2Text         `json:"text"`
+	Content   string            `json:"content"`
+	Href      card2Text         `json:"href"`
+	UserID    string            `json:"user_id"`
+	UserName  string            `json:"user_name"`
+	ImageKey  string            `json:"image_key"`
+	URL       string            `json:"url"`
+	Level     int               `json:"level"`
+	Behaviors json.RawMessage   `json:"behaviors"`
+	Property  card2Property     `json:"property"`
+	Elements  []json.RawMessage `json:"elements"`
 	// Flat-serialization containers mount children directly (no property
 	// wrapper); see user_card_content for Card 2.0 originals.
 	Columns []json.RawMessage `json:"columns"`
 	Rows    json.RawMessage   `json:"rows"`
+}
+
+// card2Text is an element's "text" (or "href"): a plain string in some
+// serializations, a {"tag":"plain_text"|"lark_md","content":...} object in
+// the flat user_card_content one, and an object for per-platform links. A
+// string-typed field would fail the whole element's Unmarshal on the object
+// form and silently drop it (buttons, divs, markdown bodies).
+type card2Text string
+
+func (t *card2Text) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		*t = card2Text(s)
+		return nil
+	}
+	var obj struct {
+		Content string `json:"content"`
+	}
+	if json.Unmarshal(b, &obj) == nil {
+		*t = card2Text(obj.Content)
+	}
+	return nil
 }
 
 // card2Property is the component payload of a Card 2.0 raw-DSL element.
@@ -387,12 +410,18 @@ type card2Property struct {
 func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]string, keyMap map[string]string) {
 	var elem card2Element
 	if err := json.Unmarshal(raw, &elem); err != nil {
-		return
+		// A field of unexpected JSON type (e.g. markdown's object-valued
+		// href) is skipped while the rest still decodes; render what we got
+		// instead of dropping the whole element.
+		var typeErr *json.UnmarshalTypeError
+		if !errors.As(err, &typeErr) {
+			return
+		}
 	}
 	prop := elem.Property
 	switch elem.Tag {
 	case "plain_text", "text":
-		if c := firstNonEmpty(prop.Content, elem.Content, elem.Text); c != "" {
+		if c := firstNonEmpty(prop.Content, elem.Content, string(elem.Text)); c != "" {
 			*parts = append(*parts, cleanCard2Text(c, keyMap))
 		}
 	case "heading":
@@ -420,11 +449,11 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 			}
 			return
 		}
-		if c := firstNonEmpty(prop.Content, elem.Content, elem.Text); c != "" {
+		if c := firstNonEmpty(prop.Content, elem.Content, string(elem.Text)); c != "" {
 			*parts = append(*parts, cleanCard2Text(c, keyMap))
 		}
 	case "a":
-		switch t, h := cleanCard2Text(firstNonEmpty(prop.Content, elem.Text), keyMap), elem.Href; {
+		switch t, h := cleanCard2Text(firstNonEmpty(prop.Content, string(elem.Text)), keyMap), string(elem.Href); {
 		case t != "" && h != "":
 			*parts = append(*parts, fmt.Sprintf("[%s](%s)", t, h))
 		case t != "":
@@ -473,7 +502,8 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 		}
 		appendCard2Table(cols, rowsRaw, parts, keyMap)
 	case "img", "image":
-		if k := firstNonEmpty(elem.ImageKey, prop.ImageKey, prop.ImageKeyC); k != "" {
+		// Table cells render without an image sink (nil imageKeys).
+		if k := firstNonEmpty(elem.ImageKey, prop.ImageKey, prop.ImageKeyC); k != "" && imageKeys != nil {
 			*imageKeys = append(*imageKeys, k)
 		}
 	case "button", "action":
@@ -484,18 +514,23 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 			label = strings.Join(tmp, "")
 		}
 		if label == "" {
-			label = firstNonEmpty(elem.Content, elem.Text)
+			label = firstNonEmpty(elem.Content, string(elem.Text))
 		}
 		openURL := ""
-		if len(prop.Behaviors) > 0 {
+		behaviorsRaw := prop.Behaviors
+		if len(behaviorsRaw) == 0 {
+			behaviorsRaw = elem.Behaviors
+		}
+		if len(behaviorsRaw) > 0 {
 			var behaviors []struct {
-				Type string `json:"type"`
-				URL  string `json:"url"`
+				Type       string `json:"type"`
+				URL        string `json:"url"`
+				DefaultURL string `json:"default_url"`
 			}
-			if json.Unmarshal(prop.Behaviors, &behaviors) == nil {
+			if json.Unmarshal(behaviorsRaw, &behaviors) == nil {
 				for _, b := range behaviors {
-					if (b.Type == "open_url" || b.Type == "openUrl") && b.URL != "" {
-						openURL = b.URL
+					if u := firstNonEmpty(b.URL, b.DefaultURL); (b.Type == "open_url" || b.Type == "openUrl") && u != "" {
+						openURL = u
 						break
 					}
 				}
@@ -529,9 +564,9 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 		for _, nested := range elem.Elements {
 			appendCard2Element(nested, parts, imageKeys, keyMap)
 		}
-		if c := firstNonEmpty(prop.Content, elem.Content, elem.Text); c != "" &&
+		if c := firstNonEmpty(prop.Content, elem.Content, string(elem.Text)); c != "" &&
 			len(prop.Elements) == 0 && len(prop.Columns) == 0 && len(prop.Text) == 0 && len(elem.Elements) == 0 {
-			*parts = append(*parts, c)
+			*parts = append(*parts, cleanCard2Text(c, keyMap))
 		}
 	}
 }
