@@ -113,6 +113,10 @@ type replyContext struct {
 	bootstrapThread  bool
 	receiptEmoji     string // persistent reaction owned by the accepted-message callback
 	receiptMessageID string
+	// prefetchedCard is the original interactive-card payload fetched by
+	// onMessage for the group @all gate / shared history, so dispatch does
+	// not fetch it twice.
+	prefetchedCard string
 }
 
 type Platform struct {
@@ -1507,11 +1511,21 @@ func (p *Platform) groupHistoryScope(msg *larkim.EventMessage, chatID string) st
 }
 
 func (p *Platform) historyText(msgType, content string, mentions []*larkim.MentionEvent) string {
-	if content == "" {
+	return p.historyTextWithCard(msgType, content, mentions, "")
+}
+
+// historyTextWithCard prefers a prefetched original card payload over the
+// lossy event body, so Card 2.0 cards land in shared group history with the
+// content the agent sees rather than Feishu's "please upgrade" fallback.
+func (p *Platform) historyTextWithCard(msgType, content string, mentions []*larkim.MentionEvent, cardRaw string) string {
+	if content == "" && cardRaw == "" {
 		return ""
 	}
 	switch msgType {
 	case "text":
+		if content == "" {
+			return ""
+		}
 		var textBody struct {
 			Text string `json:"text"`
 		}
@@ -1520,12 +1534,23 @@ func (p *Platform) historyText(msgType, content string, mentions []*larkim.Menti
 		}
 		return stripMentions(textBody.Text, mentions, p.getBotOpenID())
 	case "post":
+		if content == "" {
+			return ""
+		}
 		return strings.TrimSpace(extractPostPlainText(content))
 	case "interactive":
-		text := strings.TrimSpace(stripMentions(extractInteractiveReceiveText(content), mentions, p.getBotOpenID()))
-		// An unparseable card degrades to the "[interactive card]" marker;
-		// keep it out of group history so it cannot crowd out real context.
-		if text == "[interactive card]" {
+		text := ""
+		if cardRaw != "" {
+			text = strings.TrimSpace(stripMentions(cardPayloadText(cardRaw), mentions, p.getBotOpenID()))
+		}
+		if text == "" && content != "" {
+			text = strings.TrimSpace(stripMentions(extractInteractiveReceiveText(content), mentions, p.getBotOpenID()))
+		}
+		// An unparseable card degrades to the "[interactive card]" marker,
+		// and a Card 2.0 card whose original payload could not be fetched
+		// degrades to title + Feishu's upgrade notice. Keep both out of
+		// shared history so they cannot crowd out real context.
+		if text == "" || text == "[interactive card]" || strings.Contains(text, card2UpgradeNotice) {
 			return ""
 		}
 		return text
@@ -1534,11 +1559,11 @@ func (p *Platform) historyText(msgType, content string, mentions []*larkim.Menti
 	}
 }
 
-func (p *Platform) rememberGroupHistory(scope, messageID, msgType, content string, mentions []*larkim.MentionEvent, senderID, senderType string) {
+func (p *Platform) rememberGroupHistory(scope, messageID, msgType, content string, mentions []*larkim.MentionEvent, senderID, senderType, cardRaw string) {
 	if !p.groupChatHistoryShare || scope == "" || !isGroupHistoryMessageType(msgType) {
 		return
 	}
-	text := p.historyText(msgType, content, mentions)
+	text := p.historyTextWithCard(msgType, content, mentions, cardRaw)
 	if text == "" {
 		return
 	}
@@ -1782,6 +1807,20 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	atEveryone := p.respondToAtEveryoneAndHere && msg.Content != nil &&
 		(strings.Contains(*msg.Content, "@_all") || strings.Contains(*msg.Content, `"user_id":"all"`))
 
+	// Card 2.0 event bodies are a lossy fallback (title + upgrade notice +
+	// placeholder image) with no elements, so an @all reference only exists
+	// in the original payload. Prefetch it when the group mention gate or
+	// shared group history needs it, and hand it to dispatch so a live card
+	// is fetched once, not twice.
+	prefetchedCard := ""
+	if msgType == "interactive" && chatType == "group" && !botMentioned && messageID != "" &&
+		(p.respondToAtEveryoneAndHere || (p.groupChatHistoryShare && !p.groupReplyAll && botOpenID != "")) {
+		prefetchedCard = p.fetchRawCardContentForInbound(ctx, messageID)
+		if p.respondToAtEveryoneAndHere && !atEveryone && cardAtAll(prefetchedCard) {
+			atEveryone = true
+		}
+	}
+
 	// With history sharing enabled, observe ordinary text/post messages only
 	// after the chat-level allow list has admitted the chat. Do this before the
 	// existing mention filter and before allow_from: the chat controls whether
@@ -1795,7 +1834,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		}
 		p.rememberGroupHistory(
 			p.groupHistoryScope(msg, chatID), messageID, msgType, stringValue(msg.Content), msg.Mentions,
-			userID, senderType,
+			userID, senderType, prefetchedCard,
 		)
 		return nil
 	}
@@ -1873,7 +1912,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
-	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey, prefetchedCard: prefetchedCard}
 	var groupHistoryCtx groupHistoryContext
 	if p.groupChatHistoryShare && chatType == "group" && !p.groupReplyAll && botOpenID != "" && (botMentioned || atEveryone) {
 		scope := p.groupHistoryScope(msg, chatID)
@@ -2128,8 +2167,13 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 		var images []core.ImageAttachment
 		usedRaw := false
 		// Card 2.0 event bodies are a lossy fallback (title + upgrade
-		// notice); prefer the original payload via user_card_content.
-		if raw := p.fetchRawCardContent(ctx, messageID); raw != "" {
+		// notice); prefer the original payload via user_card_content. For
+		// group cards the gate may already have fetched it.
+		raw := rctx.prefetchedCard
+		if raw == "" {
+			raw = p.fetchRawCardContent(ctx, messageID)
+		}
+		if raw != "" {
 			if rp, rk := extractCard2RawParts(raw, mapMentionKeys(mentions)); len(rp) > 0 || len(rk) > 0 {
 				textParts = rp
 				images = p.downloadInteractiveImages(messageID, rk)

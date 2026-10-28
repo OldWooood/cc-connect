@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/chenhg5/cc-connect/core"
 
@@ -120,11 +122,13 @@ func appendInteractiveReceiveElement(raw json.RawMessage, parts *[]string, image
 	case "a":
 		switch {
 		case elem.Text != "" && elem.Href != "":
-			*parts = append(*parts, fmt.Sprintf("[%s](%s)", elem.Text, elem.Href))
+			*parts = append(*parts, cardMarkdownLink(elem.Text, elem.Href))
 		case elem.Text != "":
 			*parts = append(*parts, elem.Text)
 		case elem.Href != "":
-			*parts = append(*parts, elem.Href)
+			if u := sanitizeCardURL(elem.Href); u != "" {
+				*parts = append(*parts, u)
+			}
 		}
 	case "at":
 		switch {
@@ -270,6 +274,45 @@ func (p *Platform) fetchRawCardContent(ctx context.Context, messageID string) st
 	return resp.Data.Items[0].Body.Content
 }
 
+// card2UpgradeNotice is the text Feishu substitutes when a Card 2.0 payload
+// has to be downgraded for the event/API body. A card reduced to a title plus
+// this notice (and a placeholder image) carries no usable content.
+const card2UpgradeNotice = "请升级至最新版本客户端，以查看内容"
+
+// cardRawPrefetchTimeout bounds the original-payload fetch on the inbound
+// path (group mention gate / shared group history), where the message is not
+// dispatched yet and the caller must not wait on a slow API.
+const cardRawPrefetchTimeout = 3 * time.Second
+
+// fetchRawCardContentForInbound is fetchRawCardContent with a bounded timeout
+// for callers that need the original payload before dispatch (the group @all
+// gate and shared group history).
+func (p *Platform) fetchRawCardContentForInbound(ctx context.Context, messageID string) string {
+	ctx, cancel := context.WithTimeout(ctx, cardRawPrefetchTimeout)
+	defer cancel()
+	return p.fetchRawCardContent(ctx, messageID)
+}
+
+// cardPayloadText renders any inbound card serialization to text: the Card 2.0
+// original DSL first, then the receive-format envelope (Card 1.0 original or
+// degraded event body).
+func cardPayloadText(cardJSON string) string {
+	if cardJSON == "" {
+		return ""
+	}
+	if parts, _ := extractCard2RawParts(cardJSON, nil); len(parts) > 0 {
+		return strings.Join(parts, "\n")
+	}
+	return extractInteractiveReceiveText(cardJSON)
+}
+
+// cardAtAll reports whether a card payload @-mentions everyone. Card 2.0
+// event bodies are a degraded fallback with no elements, so for those the
+// token only exists in the original payload fetched via user_card_content.
+func cardAtAll(cardJSON string) bool {
+	return strings.Contains(cardPayloadText(cardJSON), "@all")
+}
+
 // downloadInteractiveImages fetches card image_keys best-effort: a failed
 // image is logged and skipped so one expired image_key does not drop the
 // whole card turn.
@@ -386,7 +429,9 @@ func (t *card2Text) UnmarshalJSON(b []byte) error {
 	}
 	if json.Unmarshal(b, &obj) == nil {
 		*t = card2Text(obj.Content)
+		return nil
 	}
+	slog.Debug("feishu: card 2.0 text field has unexpected JSON type", "raw", truncateForLog(string(b), 200))
 	return nil
 }
 
@@ -455,11 +500,13 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 	case "a":
 		switch t, h := cleanCard2Text(firstNonEmpty(prop.Content, string(elem.Text)), keyMap), string(elem.Href); {
 		case t != "" && h != "":
-			*parts = append(*parts, fmt.Sprintf("[%s](%s)", t, h))
+			*parts = append(*parts, cardMarkdownLink(t, h))
 		case t != "":
 			*parts = append(*parts, t)
 		case h != "":
-			*parts = append(*parts, h)
+			if u := sanitizeCardURL(h); u != "" {
+				*parts = append(*parts, u)
+			}
 		}
 	case "at":
 		uid := firstNonEmpty(prop.UserID, elem.UserID)
@@ -538,9 +585,9 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 		}
 		switch {
 		case label != "" && openURL != "":
-			*parts = append(*parts, fmt.Sprintf("[%s](%s)", label, openURL))
+			*parts = append(*parts, cardMarkdownLink(label, openURL))
 		case label != "" && elem.URL != "":
-			*parts = append(*parts, fmt.Sprintf("[%s](%s)", label, elem.URL))
+			*parts = append(*parts, cardMarkdownLink(label, elem.URL))
 		case label != "":
 			*parts = append(*parts, label)
 		}
@@ -731,6 +778,36 @@ func appendCard2Table(columnRaws []json.RawMessage, rowsRaw json.RawMessage, par
 	}
 }
 
+// sanitizeCardURL makes a card-supplied URL safe to inline into agent-visible
+// text: control characters (which could inject extra prompt lines) are
+// dropped, and destinations that would break Markdown link syntax use the
+// angle-bracket form. Unrepresentable URLs are dropped.
+func sanitizeCardURL(raw string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, raw)
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "" || strings.ContainsAny(cleaned, "<>") {
+		return ""
+	}
+	if strings.ContainsAny(cleaned, "() ") {
+		return "<" + cleaned + ">"
+	}
+	return cleaned
+}
+
+// cardMarkdownLink renders label/url as a Markdown link, degrading to the
+// bare label when the URL cannot be represented safely.
+func cardMarkdownLink(label, rawURL string) string {
+	if url := sanitizeCardURL(rawURL); url != "" {
+		return fmt.Sprintf("[%s](%s)", label, url)
+	}
+	return label
+}
+
 // appendCardLink extracts the whole-card jump link (card_link.url, with
 // per-platform fallbacks) so the agent knows where tapping the card leads.
 // Rendered after the body content to keep the card text contiguous.
@@ -748,7 +825,7 @@ func appendCardLinkRaw(raw json.RawMessage, parts *[]string) {
 	if json.Unmarshal(raw, &link) != nil {
 		return
 	}
-	if url := firstNonEmpty(link.URL, link.PCURL, link.PCURLC, link.AndroidURL, link.IOSURL); url != "" {
+	if url := sanitizeCardURL(firstNonEmpty(link.URL, link.PCURL, link.PCURLC, link.AndroidURL, link.IOSURL)); url != "" {
 		*parts = append(*parts, "[卡片链接]("+url+")")
 	}
 }

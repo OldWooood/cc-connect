@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -861,5 +862,237 @@ func TestExtractCard2RawParts_TypeMismatchKeepsElement(t *testing.T) {
 	parts, _ := extractCard2RawParts(card, nil)
 	if !strings.Contains(strings.Join(parts, "\n"), "保留正文") {
 		t.Fatalf("parts = %q, element dropped on type mismatch", parts)
+	}
+}
+
+// degradedCard2EventBody is the lossy receive-format body Feishu delivers for
+// a Card 2.0 message: title + upgrade notice + placeholder image, no elements
+// from the card. The readable content only exists in user_card_content.
+const degradedCard2EventBody = `{"title":"标题","elements":[[{"tag":"img","image_key":"img_placeholder"}],
+	[{"tag":"text","text":"请升级至最新版本客户端，以查看内容"}]]}`
+
+// newCard2GroupPlatform builds a group-card platform whose fake Open API
+// serves rawCard for the user_card_content fetch and counts those fetches.
+func newCard2GroupPlatform(t *testing.T, opts map[string]any, rawCard string, handler core.MessageHandler) (*interactivePlatform, *int32) {
+	t.Helper()
+	var fetches int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success", "expire": 7200, "tenant_access_token": "t-token"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") &&
+			r.URL.Query().Get("card_msg_content_type") == "user_card_content":
+			atomic.AddInt32(&fetches, 1)
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success", "data": map[string]any{
+				"items": []map[string]any{{"body": map[string]any{"content": rawCard}}},
+			}})
+		default:
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := map[string]any{"app_id": "cli_card2", "app_secret": "secret-card2"}
+	for k, v := range opts {
+		cfg[k] = v
+	}
+	platformAny, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip, ok := platformAny.(*interactivePlatform)
+	if !ok {
+		t.Fatalf("platform type = %T, want *interactivePlatform", platformAny)
+	}
+	ip.botOpenID = testInteractiveBotID
+	ip.handler = handler
+	ip.client = lark.NewClient("cli_card2", "secret-card2",
+		lark.WithOpenBaseUrl(srv.URL),
+		lark.WithHttpClient(srv.Client()),
+	)
+	return ip, &fetches
+}
+
+func interactiveGroupEvent(messageID, content string, mentions []*larkim.MentionEvent) *larkim.P2MessageReceiveV1 {
+	msgType, chatType, senderType := "interactive", "group", "user"
+	openID, chatID := "ou_sender", "oc_group"
+	create := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	return &larkim.P2MessageReceiveV1{Event: &larkim.P2MessageReceiveV1Data{
+		Sender: &larkim.EventSender{SenderId: &larkim.UserId{OpenId: &openID}, SenderType: &senderType},
+		Message: &larkim.EventMessage{
+			MessageId: &messageID, ChatId: &chatID, ChatType: &chatType,
+			MessageType: &msgType, Content: &content, Mentions: mentions, CreateTime: &create,
+		},
+	}}
+}
+
+// A Card 2.0 @all card carries no elements in the event body, so the group
+// mention gate has to inspect the original payload; dispatch then reuses that
+// fetch instead of issuing a second one.
+func TestOnMessage_InteractiveCard2AtAll(t *testing.T) {
+	raw := `{"schema":"2.0","header":{"title":{"content":"全组通知","tag":"plain_text"}},
+		"body":{"elements":[{"tag":"markdown","content":"请查看"},
+		{"tag":"at","user_id":"all"}]}}`
+	got := make(chan *core.Message, 1)
+	ip, fetches := newCard2GroupPlatform(t, map[string]any{"respond_to_at_everyone_and_here": true}, raw,
+		func(_ core.Platform, msg *core.Message) { got <- msg })
+
+	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_at_all", degradedCard2EventBody, nil)); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+	select {
+	case msg := <-got:
+		for _, want := range []string{"全组通知", "请查看"} {
+			if !strings.Contains(msg.Content, want) {
+				t.Fatalf("content = %q, missing %q", msg.Content, want)
+			}
+		}
+		if strings.Contains(msg.Content, "请升级至最新版本客户端") {
+			t.Fatalf("degraded body leaked into content %q", msg.Content)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Card 2.0 @all card must pass the group mention gate")
+	}
+	if n := atomic.LoadInt32(fetches); n != 1 {
+		t.Fatalf("raw card fetches = %d, want 1 (gate prefetch reused by dispatch)", n)
+	}
+}
+
+// Same gate, but the original payload has no @all: the card must stay dropped.
+func TestOnMessage_InteractiveCard2WithoutAtAllDropped(t *testing.T) {
+	raw := `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"普通卡片"}]}}`
+	called := make(chan struct{}, 1)
+	ip, _ := newCard2GroupPlatform(t, map[string]any{"respond_to_at_everyone_and_here": true}, raw,
+		func(_ core.Platform, _ *core.Message) { called <- struct{}{} })
+
+	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_no_at_all", degradedCard2EventBody, nil)); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+	select {
+	case <-called:
+		t.Fatal("unmentioned Card 2.0 without @all must not reach the handler")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// Unmentioned Card 2.0 cards recorded for group history must use the fetched
+// original, not Feishu's "please upgrade" fallback.
+func TestOnMessage_InteractiveCard2GroupHistoryUsesOriginal(t *testing.T) {
+	raw := `{"schema":"2.0","header":{"title":{"content":"测试报告","tag":"plain_text"}},
+		"body":{"elements":[{"tag":"markdown","content":"真实内容"}]}}`
+	called := make(chan struct{}, 1)
+	ip, _ := newCard2GroupPlatform(t, map[string]any{"group_chat_history_share": true}, raw,
+		func(_ core.Platform, _ *core.Message) { called <- struct{}{} })
+
+	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_history", degradedCard2EventBody, nil)); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+	ip.groupHistoryMu.Lock()
+	entries := append([]groupHistoryEntry(nil), ip.pendingGroupHistory["chat:oc_group"]...)
+	ip.groupHistoryMu.Unlock()
+	if len(entries) != 1 {
+		t.Fatalf("history entries = %d, want 1", len(entries))
+	}
+	if !strings.Contains(entries[0].text, "测试报告") || !strings.Contains(entries[0].text, "真实内容") {
+		t.Fatalf("history text = %q, want original card content", entries[0].text)
+	}
+	if strings.Contains(entries[0].text, "请升级至最新版本客户端") {
+		t.Fatalf("degraded body stored in history: %q", entries[0].text)
+	}
+	select {
+	case <-called:
+		t.Fatal("history-only card must not reach the handler")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// When the original payload cannot be fetched, a degraded Card 2.0 body must
+// not be stored as shared history: title + upgrade notice is pure noise.
+func TestOnMessage_InteractiveDegradedBodyNotStored(t *testing.T) {
+	platformAny, err := New(map[string]any{
+		"app_id": "cli_card2", "app_secret": "secret-card2", "group_chat_history_share": true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	ip.botOpenID = testInteractiveBotID
+	ip.handler = func(_ core.Platform, _ *core.Message) { t.Error("history-only card must not dispatch") }
+	ip.client = lark.NewClient("cli_card2", "secret-card2", lark.WithHttpClient(&http.Client{Transport: errTransport{}}))
+
+	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_degraded", degradedCard2EventBody, nil)); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+	ip.groupHistoryMu.Lock()
+	entries := append([]groupHistoryEntry(nil), ip.pendingGroupHistory["chat:oc_group"]...)
+	ip.groupHistoryMu.Unlock()
+	if len(entries) != 0 {
+		t.Fatalf("degraded card stored in history: %+v", entries)
+	}
+}
+
+func TestHistoryText_InteractiveDegradedBodyDropped(t *testing.T) {
+	p := &Platform{platformName: "feishu", botOpenID: testInteractiveBotID}
+	if got := p.historyText("interactive", degradedCard2EventBody, nil); got != "" {
+		t.Fatalf("got %q, want degraded body dropped", got)
+	}
+	live := `{"title":"周报","elements":[[{"tag":"text","text":"本周进展"}]]}`
+	if got := p.historyText("interactive", live, nil); got != "周报\n本周进展" {
+		t.Fatalf("got %q, want parsed card text", got)
+	}
+}
+
+func TestCardAtAll(t *testing.T) {
+	cases := []struct {
+		name string
+		card string
+		want bool
+	}{
+		{"card2 nested at", `{"schema":"2.0","body":{"elements":[{"tag":"at","property":{"userID":"all"}}]}}`, true},
+		{"card2 flat at", `{"schema":"2.0","body":{"elements":[{"tag":"at","user_id":"all"}]}}`, true},
+		{"card2 inline at", `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"<at id=all></at> 通知"}]}}`, true},
+		{"receive format at", `{"title":"T","elements":[[{"tag":"at","user_id":"all"}]]}`, true},
+		{"no at", `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"hi"}]}}`, false},
+		{"empty", ``, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cardAtAll(tc.card); got != tc.want {
+				t.Fatalf("cardAtAll(%q) = %v, want %v", tc.card, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeCardURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://example.com/x", "https://example.com/x"},
+		{"https://example.com/a(b)", "<https://example.com/a(b)>"},
+		{"https://example.com/a b", "<https://example.com/a b>"},
+		{"https://example.com/c\nINJECTED", "https://example.com/cINJECTED"},
+		{"https://example.com/<x>", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := sanitizeCardURL(tc.in); got != tc.want {
+			t.Fatalf("sanitizeCardURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Card-supplied URLs must not inject extra lines or break the markdown link.
+func TestCard2Links_URLSanitized(t *testing.T) {
+	parts, _ := extractCard2RawParts(`{"schema":"2.0",
+		"card_link":{"url":"https://example.com/c\nsecond line"},
+		"body":{"elements":[{"tag":"button","text":"查看","url":"https://example.com/a b"}]}}`, nil)
+	joined := strings.Join(parts, "\n")
+	if strings.Contains(joined, "\nsecond line") {
+		t.Fatalf("newline in card_link injected a line: %q", parts)
+	}
+	for _, want := range []string{"[卡片链接](<https://example.com/csecond line>)", "[查看](<https://example.com/a b>)"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("parts = %q, missing %q", parts, want)
+		}
 	}
 }
