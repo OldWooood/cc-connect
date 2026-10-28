@@ -2176,7 +2176,10 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 		usedRaw := false
 		// Card 2.0 event bodies are a lossy fallback (title + upgrade
 		// notice); prefer the original payload via user_card_content. For
-		// group cards the gate may already have fetched it.
+		// group cards the gate may already have fetched it; a prefetch that
+		// ran (and failed or timed out) is final and is not retried here, so
+		// the turn degrades to the event body just like a card with no
+		// readable original at all.
 		raw := rctx.prefetchedCard
 		if raw == "" && !rctx.cardFetchAttempted {
 			raw = p.fetchRawCardContent(ctx, messageID)
