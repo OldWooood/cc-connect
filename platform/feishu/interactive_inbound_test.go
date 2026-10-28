@@ -794,7 +794,7 @@ func TestCard2Button_DirectURL(t *testing.T) {
 	var parts []string
 	appendCard2Element(
 		json.RawMessage(`{"tag":"button","text":"打开","url":"https://example.com/go"}`),
-		&parts, nil, nil)
+		&parts, nil, nil, nil)
 	if len(parts) != 1 || parts[0] != "[打开](https://example.com/go)" {
 		t.Fatalf("parts = %q", parts)
 	}
@@ -806,7 +806,7 @@ func TestCard2Button_FlatTextObject(t *testing.T) {
 	var parts []string
 	appendCard2Element(
 		json.RawMessage(`{"element_id":"_4","tag":"button","text":{"content":"查看 Issue","tag":"plain_text"},"type":"primary","url":"https://example.com/issue/1"}`),
-		&parts, nil, nil)
+		&parts, nil, nil, nil)
 	if len(parts) != 1 || parts[0] != "[查看 Issue](https://example.com/issue/1)" {
 		t.Fatalf("parts = %q", parts)
 	}
@@ -816,7 +816,7 @@ func TestCard2Button_BehaviorDefaultURL(t *testing.T) {
 	var parts []string
 	appendCard2Element(
 		json.RawMessage(`{"tag":"button","text":{"tag":"plain_text","content":"打开"},"behaviors":[{"type":"open_url","default_url":"https://example.com/go"}]}`),
-		&parts, nil, nil)
+		&parts, nil, nil, nil)
 	if len(parts) != 1 || parts[0] != "[打开](https://example.com/go)" {
 		t.Fatalf("parts = %q", parts)
 	}
@@ -959,20 +959,29 @@ func TestOnMessage_InteractiveCard2AtAll(t *testing.T) {
 	}
 }
 
-// Same gate, but the original payload has no @all: the card must stay dropped.
+// Same gate, but the original payload has no structural @all: the card must
+// stay dropped. Prose that merely writes "@all" is not a mention.
 func TestOnMessage_InteractiveCard2WithoutAtAllDropped(t *testing.T) {
-	raw := `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"普通卡片"}]}}`
-	called := make(chan struct{}, 1)
-	ip, _ := newCard2GroupPlatform(t, map[string]any{"respond_to_at_everyone_and_here": true}, raw,
-		func(_ core.Platform, _ *core.Message) { called <- struct{}{} })
-
-	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_no_at_all", degradedCard2EventBody, nil)); err != nil {
-		t.Fatalf("onMessage() error = %v", err)
+	cases := map[string]string{
+		"plain card":     `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"普通卡片"}]}}`,
+		"prose at-all":   `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"请在群里 @all 一下这个审批流程"}]}}`,
+		"prose in title": `{"title":"@all 通知","elements":[[{"tag":"text","text":"正常内容"}]]}`,
 	}
-	select {
-	case <-called:
-		t.Fatal("unmentioned Card 2.0 without @all must not reach the handler")
-	case <-time.After(500 * time.Millisecond):
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			called := make(chan struct{}, 1)
+			ip, _ := newCard2GroupPlatform(t, map[string]any{"respond_to_at_everyone_and_here": true}, raw,
+				func(_ core.Platform, _ *core.Message) { called <- struct{}{} })
+
+			if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_no_at_all", degradedCard2EventBody, nil)); err != nil {
+				t.Fatalf("onMessage() error = %v", err)
+			}
+			select {
+			case <-called:
+				t.Fatal("unmentioned Card 2.0 without a structural @all must not reach the handler")
+			case <-time.After(500 * time.Millisecond):
+			}
+		})
 	}
 }
 
@@ -982,8 +991,11 @@ func TestOnMessage_InteractiveCard2GroupHistoryUsesOriginal(t *testing.T) {
 	raw := `{"schema":"2.0","header":{"title":{"content":"测试报告","tag":"plain_text"}},
 		"body":{"elements":[{"tag":"markdown","content":"真实内容"}]}}`
 	called := make(chan struct{}, 1)
-	ip, _ := newCard2GroupPlatform(t, map[string]any{"group_chat_history_share": true}, raw,
-		func(_ core.Platform, _ *core.Message) { called <- struct{}{} })
+	// The @all option is what triggers the prefetch; shared history reuses it.
+	ip, _ := newCard2GroupPlatform(t, map[string]any{
+		"group_chat_history_share":        true,
+		"respond_to_at_everyone_and_here": true,
+	}, raw, func(_ core.Platform, _ *core.Message) { called <- struct{}{} })
 
 	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_history", degradedCard2EventBody, nil)); err != nil {
 		t.Fatalf("onMessage() error = %v", err)
@@ -1007,22 +1019,19 @@ func TestOnMessage_InteractiveCard2GroupHistoryUsesOriginal(t *testing.T) {
 	}
 }
 
-// When the original payload cannot be fetched, a degraded Card 2.0 body must
-// not be stored as shared history: title + upgrade notice is pure noise.
-func TestOnMessage_InteractiveDegradedBodyNotStored(t *testing.T) {
-	platformAny, err := New(map[string]any{
-		"app_id": "cli_card2", "app_secret": "secret-card2", "group_chat_history_share": true,
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	ip := platformAny.(*interactivePlatform)
-	ip.botOpenID = testInteractiveBotID
-	ip.handler = func(_ core.Platform, _ *core.Message) { t.Error("history-only card must not dispatch") }
-	ip.client = lark.NewClient("cli_card2", "secret-card2", lark.WithHttpClient(&http.Client{Transport: errTransport{}}))
+// History sharing alone must not put a fetch on the event-ack path: the
+// prefetch exists for the @all gate, and a degraded Card 2.0 body is dropped
+// from history instead of being stored as title + upgrade notice.
+func TestOnMessage_InteractiveHistoryOnlySkipsPrefetch(t *testing.T) {
+	raw := `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"真实内容"}]}}`
+	ip, fetches := newCard2GroupPlatform(t, map[string]any{"group_chat_history_share": true}, raw,
+		func(_ core.Platform, _ *core.Message) { t.Error("history-only card must not dispatch") })
 
-	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_degraded", degradedCard2EventBody, nil)); err != nil {
+	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_history_skip", degradedCard2EventBody, nil)); err != nil {
 		t.Fatalf("onMessage() error = %v", err)
+	}
+	if n := atomic.LoadInt32(fetches); n != 0 {
+		t.Fatalf("raw card fetches = %d, want 0 for history-only", n)
 	}
 	ip.groupHistoryMu.Lock()
 	entries := append([]groupHistoryEntry(nil), ip.pendingGroupHistory["chat:oc_group"]...)
@@ -1054,6 +1063,8 @@ func TestCardAtAll(t *testing.T) {
 		{"card2 inline at", `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"<at id=all></at> 通知"}]}}`, true},
 		{"receive format at", `{"title":"T","elements":[[{"tag":"at","user_id":"all"}]]}`, true},
 		{"no at", `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"hi"}]}}`, false},
+		{"prose at-all", `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"请在群里 @all 一下这个审批流程"}]}}`, false},
+		{"prose at-all in title", `{"title":"@all 通知","elements":[[{"tag":"text","text":"hi"}]]}`, false},
 		{"empty", ``, false},
 	}
 	for _, tc := range cases {
@@ -1094,5 +1105,66 @@ func TestCard2Links_URLSanitized(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("parts = %q, missing %q", parts, want)
 		}
+	}
+}
+
+// A card-supplied label must not be able to retarget the link destination.
+func TestCardMarkdownLink_LabelEscaped(t *testing.T) {
+	got := cardMarkdownLink("click](https://evil.test)", "https://x.test/a")
+	want := `[click\](https://evil.test)](https://x.test/a)`
+	if got != want {
+		t.Fatalf("cardMarkdownLink() = %q, want %q", got, want)
+	}
+	if got := cardMarkdownLink("[换\n行]", "https://x.test/a"); got != `[\[换 行\]](https://x.test/a)` {
+		t.Fatalf("label with brackets/newline = %q", got)
+	}
+}
+
+// A failed gate prefetch must not be retried by the async dispatch path, so
+// event acknowledgement costs one bounded call at most.
+func TestOnMessage_InteractivePrefetchFailureNotRetried(t *testing.T) {
+	var fetches int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success", "expire": 7200, "tenant_access_token": "t-token"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") &&
+			r.URL.Query().Get("card_msg_content_type") == "user_card_content":
+			atomic.AddInt32(&fetches, 1)
+			writeJSON(t, w, map[string]any{"code": 12345, "msg": "card fetch failed"})
+		default:
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	got := make(chan *core.Message, 1)
+	platformAny, err := New(map[string]any{
+		"app_id": "cli_card2", "app_secret": "secret-card2",
+		"respond_to_at_everyone_and_here": true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	// An empty bot open_id keeps the mention filter inactive, so the card is
+	// dispatched even though the prefetch failed.
+	ip.handler = func(_ core.Platform, msg *core.Message) { got <- msg }
+	ip.client = lark.NewClient("cli_card2", "secret-card2",
+		lark.WithOpenBaseUrl(srv.URL),
+		lark.WithHttpClient(srv.Client()),
+	)
+
+	if err := ip.onMessage(context.Background(), interactiveGroupEvent("om_card2_prefetch_fail", degradedCard2EventBody, nil)); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("card must still dispatch after a failed prefetch")
+	}
+	if n := atomic.LoadInt32(&fetches); n != 1 {
+		t.Fatalf("raw card fetches = %d, want 1 (failed prefetch must not be retried)", n)
 	}
 }

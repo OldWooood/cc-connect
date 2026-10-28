@@ -105,11 +105,19 @@ func interactiveOptionLabels(raw json.RawMessage) []string {
 	return nil
 }
 
+// markAtAll records a structural @-everyone mention while rendering. The sink
+// is nil for callers that only need the text.
+func markAtAll(atAll *bool, hit bool) {
+	if hit && atAll != nil {
+		*atAll = true
+	}
+}
+
 // appendInteractiveReceiveElement renders one receive-format element. At
 // mentions are emitted as their "@_user_N" token so the caller can resolve
 // them through the event mentions list (stripMentions/replaceMentions),
 // exactly like the text-message path does.
-func appendInteractiveReceiveElement(raw json.RawMessage, parts *[]string, imageKeys *[]string) {
+func appendInteractiveReceiveElement(raw json.RawMessage, parts *[]string, imageKeys *[]string, atAll *bool) {
 	var elem interactiveReceiveElement
 	if err := json.Unmarshal(raw, &elem); err != nil {
 		return
@@ -133,6 +141,7 @@ func appendInteractiveReceiveElement(raw json.RawMessage, parts *[]string, image
 	case "at":
 		switch {
 		case elem.UserID == "all":
+			markAtAll(atAll, true)
 			*parts = append(*parts, "@all")
 		case elem.UserID != "":
 			*parts = append(*parts, elem.UserID)
@@ -151,7 +160,7 @@ func appendInteractiveReceiveElement(raw json.RawMessage, parts *[]string, image
 		*parts = append(*parts, "---")
 	case "note":
 		for _, nested := range flattenInteractiveRows(elem.Elements) {
-			appendInteractiveReceiveElement(nested, parts, imageKeys)
+			appendInteractiveReceiveElement(nested, parts, imageKeys, atAll)
 		}
 	case "select_static", "overflow":
 		if elem.Placeholder != "" {
@@ -185,13 +194,20 @@ func appendInteractiveReceiveElement(raw json.RawMessage, parts *[]string, image
 // not in receive format (the caller falls back to extractInteractiveCardText,
 // which covers schema 2.0 and raw_card_content payloads).
 func extractInteractiveReceiveParts(content string) (parts []string, imageKeys []string) {
+	parts, imageKeys, _ = extractInteractiveReceivePartsWithFlags(content)
+	return parts, imageKeys
+}
+
+// extractInteractiveReceivePartsWithFlags is extractInteractiveReceiveParts
+// plus whether the body carries a structural @-everyone element.
+func extractInteractiveReceivePartsWithFlags(content string) (parts []string, imageKeys []string, atAll bool) {
 	var card struct {
 		Title    string          `json:"title"`
 		Elements json.RawMessage `json:"elements"`
 		CardLink json.RawMessage `json:"card_link"`
 	}
 	if err := json.Unmarshal([]byte(content), &card); err != nil {
-		return nil, nil
+		return nil, nil, false
 	}
 	// Tolerate locale-wrapped bodies ({"zh_cn": {...}}) the same way the
 	// post parser does: retry with the first object value that parses.
@@ -211,16 +227,16 @@ func extractInteractiveReceiveParts(content string) (parts []string, imageKeys [
 		}
 	}
 	if len(card.Elements) == 0 && card.Title == "" {
-		return nil, nil
+		return nil, nil, false
 	}
 	if card.Title != "" {
 		parts = append(parts, card.Title)
 	}
 	for _, raw := range flattenInteractiveRows(card.Elements) {
-		appendInteractiveReceiveElement(raw, &parts, &imageKeys)
+		appendInteractiveReceiveElement(raw, &parts, &imageKeys, &atAll)
 	}
 	appendCardLinkRaw(card.CardLink, &parts)
-	return parts, imageKeys
+	return parts, imageKeys, atAll
 }
 
 // extractInteractiveReceiveText renders an inbound interactive card body to
@@ -280,9 +296,9 @@ func (p *Platform) fetchRawCardContent(ctx context.Context, messageID string) st
 const card2UpgradeNotice = "请升级至最新版本客户端，以查看内容"
 
 // cardRawPrefetchTimeout bounds the original-payload fetch on the inbound
-// path (group mention gate / shared group history), where the message is not
-// dispatched yet and the caller must not wait on a slow API.
-const cardRawPrefetchTimeout = 3 * time.Second
+// path (group mention gate), which runs before Feishu's event acknowledgement
+// and therefore must stay short: a miss simply falls back to the event body.
+const cardRawPrefetchTimeout = 1 * time.Second
 
 // fetchRawCardContentForInbound is fetchRawCardContent with a bounded timeout
 // for callers that need the original payload before dispatch (the group @all
@@ -306,11 +322,19 @@ func cardPayloadText(cardJSON string) string {
 	return extractInteractiveReceiveText(cardJSON)
 }
 
-// cardAtAll reports whether a card payload @-mentions everyone. Card 2.0
-// event bodies are a degraded fallback with no elements, so for those the
-// token only exists in the original payload fetched via user_card_content.
+// cardAtAll reports whether a card payload structurally @-mentions everyone.
+// The flag is collected while rendering an `at` element (user_id "all") or an
+// inline <at id=all>, never by substring-matching the rendered text: a card
+// that merely writes "@all" in prose must not trigger the bot.
 func cardAtAll(cardJSON string) bool {
-	return strings.Contains(cardPayloadText(cardJSON), "@all")
+	if cardJSON == "" {
+		return false
+	}
+	if parts, _, atAll := extractCard2RawPartsWithFlags(cardJSON, nil); len(parts) > 0 {
+		return atAll
+	}
+	_, _, atAll := extractInteractiveReceivePartsWithFlags(cardJSON)
+	return atAll
 }
 
 // downloadInteractiveImages fetches card image_keys best-effort: a failed
@@ -451,8 +475,9 @@ type card2Property struct {
 
 // appendCard2Element renders one Card 2.0 raw-DSL component. At mentions
 // carry real user IDs, so they are rewritten to @_user_N placeholders via
-// keyMap (built from the event mentions) for stripMentions downstream.
-func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]string, keyMap map[string]string) {
+// keyMap (built from the event mentions) for stripMentions downstream. A
+// structural @-everyone element is reported through atAll (may be nil).
+func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]string, keyMap map[string]string, atAll *bool) {
 	var elem card2Element
 	if err := json.Unmarshal(raw, &elem); err != nil {
 		// A field of unexpected JSON type (e.g. markdown's object-valued
@@ -467,13 +492,13 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 	switch elem.Tag {
 	case "plain_text", "text":
 		if c := firstNonEmpty(prop.Content, elem.Content, string(elem.Text)); c != "" {
-			*parts = append(*parts, cleanCard2Text(c, keyMap))
+			*parts = append(*parts, cleanCard2Text(c, keyMap, atAll))
 		}
 	case "heading":
 		var inner []string
 		for _, nested := range prop.Elements {
 			var tmp []string
-			appendCard2Element(nested, &tmp, imageKeys, keyMap)
+			appendCard2Element(nested, &tmp, imageKeys, keyMap, atAll)
 			inner = append(inner, tmp...)
 		}
 		text := strings.Join(inner, "")
@@ -490,15 +515,15 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 	case "markdown":
 		if len(prop.Elements) > 0 {
 			for _, nested := range prop.Elements {
-				appendCard2Element(nested, parts, imageKeys, keyMap)
+				appendCard2Element(nested, parts, imageKeys, keyMap, atAll)
 			}
 			return
 		}
 		if c := firstNonEmpty(prop.Content, elem.Content, string(elem.Text)); c != "" {
-			*parts = append(*parts, cleanCard2Text(c, keyMap))
+			*parts = append(*parts, cleanCard2Text(c, keyMap, atAll))
 		}
 	case "a":
-		switch t, h := cleanCard2Text(firstNonEmpty(prop.Content, string(elem.Text)), keyMap), string(elem.Href); {
+		switch t, h := cleanCard2Text(firstNonEmpty(prop.Content, string(elem.Text)), keyMap, atAll), string(elem.Href); {
 		case t != "" && h != "":
 			*parts = append(*parts, cardMarkdownLink(t, h))
 		case t != "":
@@ -512,6 +537,7 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 		uid := firstNonEmpty(prop.UserID, elem.UserID)
 		switch {
 		case uid == "all":
+			markAtAll(atAll, true)
 			*parts = append(*parts, "@all")
 		case uid != "":
 			if key, ok := keyMap[uid]; ok {
@@ -528,7 +554,7 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 			cols = elem.Columns
 		}
 		for _, col := range cols {
-			appendCard2Element(col, parts, imageKeys, keyMap)
+			appendCard2Element(col, parts, imageKeys, keyMap, atAll)
 		}
 	case "column":
 		nested := prop.Elements
@@ -536,7 +562,7 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 			nested = elem.Elements
 		}
 		for _, el := range nested {
-			appendCard2Element(el, parts, imageKeys, keyMap)
+			appendCard2Element(el, parts, imageKeys, keyMap, atAll)
 		}
 	case "table":
 		cols := prop.Columns
@@ -547,7 +573,7 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 		if len(rowsRaw) == 0 {
 			rowsRaw = elem.Rows
 		}
-		appendCard2Table(cols, rowsRaw, parts, keyMap)
+		appendCard2Table(cols, rowsRaw, parts, keyMap, atAll)
 	case "img", "image":
 		// Table cells render without an image sink (nil imageKeys).
 		if k := firstNonEmpty(elem.ImageKey, prop.ImageKey, prop.ImageKeyC); k != "" && imageKeys != nil {
@@ -557,7 +583,7 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 		label := prop.Content
 		if label == "" && len(prop.Text) > 0 {
 			var tmp []string
-			appendCard2Element(prop.Text, &tmp, imageKeys, keyMap)
+			appendCard2Element(prop.Text, &tmp, imageKeys, keyMap, atAll)
 			label = strings.Join(tmp, "")
 		}
 		if label == "" {
@@ -600,20 +626,20 @@ func appendCard2Element(raw json.RawMessage, parts *[]string, imageKeys *[]strin
 		// into nested element lists so new component kinds degrade to
 		// partial text instead of silence.
 		for _, nested := range prop.Elements {
-			appendCard2Element(nested, parts, imageKeys, keyMap)
+			appendCard2Element(nested, parts, imageKeys, keyMap, atAll)
 		}
 		for _, col := range prop.Columns {
-			appendCard2Element(col, parts, imageKeys, keyMap)
+			appendCard2Element(col, parts, imageKeys, keyMap, atAll)
 		}
 		if len(prop.Text) > 0 {
-			appendCard2Element(prop.Text, parts, imageKeys, keyMap)
+			appendCard2Element(prop.Text, parts, imageKeys, keyMap, atAll)
 		}
 		for _, nested := range elem.Elements {
-			appendCard2Element(nested, parts, imageKeys, keyMap)
+			appendCard2Element(nested, parts, imageKeys, keyMap, atAll)
 		}
 		if c := firstNonEmpty(prop.Content, elem.Content, string(elem.Text)); c != "" &&
 			len(prop.Elements) == 0 && len(prop.Columns) == 0 && len(prop.Text) == 0 && len(elem.Elements) == 0 {
-			*parts = append(*parts, cleanCard2Text(c, keyMap))
+			*parts = append(*parts, cleanCard2Text(c, keyMap, atAll))
 		}
 	}
 }
@@ -637,8 +663,9 @@ var card2FmtRe = regexp.MustCompile(`(?i)</?(font|b|strong|i|em|u|s|strike|del|s
 
 // cleanCard2Text normalizes Card 2.0 rich-text content for the agent:
 // inline <at> mentions become resolvable tokens, presentational tags are
-// stripped but their inner text is kept.
-func cleanCard2Text(s string, keyMap map[string]string) string {
+// stripped but their inner text is kept. An inline @-everyone mention is
+// reported through atAll (may be nil).
+func cleanCard2Text(s string, keyMap map[string]string, atAll *bool) string {
 	s = card2AtRe.ReplaceAllStringFunc(s, func(m string) string {
 		sub := card2AtRe.FindStringSubmatch(m)
 		if len(sub) < 2 {
@@ -646,6 +673,7 @@ func cleanCard2Text(s string, keyMap map[string]string) string {
 		}
 		uid := sub[1]
 		if uid == "all" {
+			markAtAll(atAll, true)
 			return "@all"
 		}
 		if key, ok := keyMap[uid]; ok {
@@ -718,7 +746,7 @@ func firstNonEmpty(vals ...string) string {
 // cells usually hold plain strings ({"col": {"data": "..."}}); element
 // objects are still supported via the generic walker. Column headers accept
 // both displayName (nested DSL) and display_name (flat DSL).
-func appendCard2Table(columnRaws []json.RawMessage, rowsRaw json.RawMessage, parts *[]string, keyMap map[string]string) {
+func appendCard2Table(columnRaws []json.RawMessage, rowsRaw json.RawMessage, parts *[]string, keyMap map[string]string, atAll *bool) {
 	type column struct {
 		DisplayName  string `json:"displayName"`
 		DisplayName2 string `json:"display_name"`
@@ -762,7 +790,7 @@ func appendCard2Table(columnRaws []json.RawMessage, rowsRaw json.RawMessage, par
 			}
 			var s string
 			if json.Unmarshal(cell, &s) == nil {
-				cells[i] = cleanCard2Text(s, keyMap)
+				cells[i] = cleanCard2Text(s, keyMap, atAll)
 				continue
 			}
 			var num float64
@@ -771,7 +799,7 @@ func appendCard2Table(columnRaws []json.RawMessage, rowsRaw json.RawMessage, par
 				continue
 			}
 			var cellParts []string
-			appendCard2Element(cell, &cellParts, nil, keyMap)
+			appendCard2Element(cell, &cellParts, nil, keyMap, atAll)
 			cells[i] = strings.Join(cellParts, " ")
 		}
 		*parts = append(*parts, "| "+strings.Join(cells, " | ")+" |")
@@ -802,10 +830,30 @@ func sanitizeCardURL(raw string) string {
 // cardMarkdownLink renders label/url as a Markdown link, degrading to the
 // bare label when the URL cannot be represented safely.
 func cardMarkdownLink(label, rawURL string) string {
-	if url := sanitizeCardURL(rawURL); url != "" {
-		return fmt.Sprintf("[%s](%s)", label, url)
+	url := sanitizeCardURL(rawURL)
+	if url == "" {
+		return label
 	}
-	return label
+	label = sanitizeCardLabel(label)
+	if label == "" {
+		return url
+	}
+	return fmt.Sprintf("[%s](%s)", label, url)
+}
+
+// sanitizeCardLabel keeps a card-supplied label from breaking out of the
+// Markdown link text: control characters collapse to spaces and the bracket /
+// backslash metacharacters are escaped, so a label like
+// "click](https://evil.test)" cannot retarget the link destination.
+func sanitizeCardLabel(label string) string {
+	label = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, label)
+	label = strings.Join(strings.Fields(label), " ")
+	return strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`).Replace(label)
 }
 
 // appendCardLink extracts the whole-card jump link (card_link.url, with
@@ -839,6 +887,13 @@ func appendCardLink(card map[string]json.RawMessage, parts *[]string) {
 // (raw_card_content). Returns nil when the input is not a 2.0 card so the
 // caller can fall back to the receive-format / legacy parsers.
 func extractCard2RawParts(cardJSON string, keyMap map[string]string) (parts []string, imageKeys []string) {
+	parts, imageKeys, _ = extractCard2RawPartsWithFlags(cardJSON, keyMap)
+	return parts, imageKeys
+}
+
+// extractCard2RawPartsWithFlags is extractCard2RawParts plus whether the card
+// carries a structural @-everyone element.
+func extractCard2RawPartsWithFlags(cardJSON string, keyMap map[string]string) (parts []string, imageKeys []string, atAll bool) {
 	raw := cardJSON
 	var wrapper struct {
 		JsonCard string `json:"json_card"`
@@ -848,14 +903,14 @@ func extractCard2RawParts(cardJSON string, keyMap map[string]string) (parts []st
 	}
 	var card map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &card); err != nil {
-		return nil, nil
+		return nil, nil, false
 	}
 	// Raw originals always carry body and/or schema. The lossy
 	// receive-format envelope ({title, elements}) carries neither: it must
 	// fall through to the receive-format parser, which understands it.
 	if _, ok := card["body"]; !ok {
 		if _, ok := card["schema"]; !ok {
-			return nil, nil
+			return nil, nil, false
 		}
 	}
 
@@ -893,32 +948,32 @@ func extractCard2RawParts(cardJSON string, keyMap map[string]string) (parts []st
 	body, ok := card["body"]
 	if !ok {
 		if len(parts) == 0 {
-			return nil, nil
+			return nil, nil, false
 		}
-		return parts, imageKeys
+		return parts, imageKeys, atAll
 	}
 	// body may be a component ({tag, property.elements}) or bare elements.
 	var bodyElem card2Element
 	if json.Unmarshal(body, &bodyElem) != nil {
 		if len(parts) == 0 {
-			return nil, nil
+			return nil, nil, false
 		}
-		return parts, imageKeys
+		return parts, imageKeys, atAll
 	}
 	if len(bodyElem.Property.Elements) > 0 {
 		for _, el := range bodyElem.Property.Elements {
-			appendCard2Element(el, &parts, &imageKeys, keyMap)
+			appendCard2Element(el, &parts, &imageKeys, keyMap, &atAll)
 		}
 	} else if len(bodyElem.Elements) > 0 {
 		for _, el := range bodyElem.Elements {
-			appendCard2Element(el, &parts, &imageKeys, keyMap)
+			appendCard2Element(el, &parts, &imageKeys, keyMap, &atAll)
 		}
 	} else {
-		appendCard2Element(body, &parts, &imageKeys, keyMap)
+		appendCard2Element(body, &parts, &imageKeys, keyMap, &atAll)
 	}
 	appendCardLink(card, &parts)
 	if len(parts) == 0 && len(imageKeys) == 0 {
-		return nil, nil
+		return nil, nil, false
 	}
-	return parts, imageKeys
+	return parts, imageKeys, atAll
 }

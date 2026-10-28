@@ -329,8 +329,9 @@ cc-connect: ✅ 这是一个 Node.js 项目，包含以下目录...
 
 开启 `respond_to_at_everyone_and_here = true` 后，卡片中的 `@所有人`
 （Card 2.0 的 `"user_id":"all"`）与文本消息的 `@_all` 行为一致，会触发机器人响应。
-群聊中为判断 `@所有人` 或记录共享历史，cc-connect 会在派发前预取一次卡片原始内容
-（每张卡片最多一次，超时 3 秒；失败时回退到事件体）。
+群聊中为判断 `@所有人`，cc-connect 会在事件应答前预取一次卡片原始内容
+（超时 1 秒，失败时回退到事件体）；开启 `group_chat_history_share` 时复用该结果，
+取不到原始内容的卡片不会写入共享历史。
 
 ```toml
 [projects.platforms.options]

@@ -114,9 +114,10 @@ type replyContext struct {
 	receiptEmoji     string // persistent reaction owned by the accepted-message callback
 	receiptMessageID string
 	// prefetchedCard is the original interactive-card payload fetched by
-	// onMessage for the group @all gate / shared history, so dispatch does
-	// not fetch it twice.
-	prefetchedCard string
+	// onMessage for the group @all gate, and cardFetchAttempted records that
+	// the fetch already ran (successful or not) so dispatch never retries it.
+	prefetchedCard     string
+	cardFetchAttempted bool
 }
 
 type Platform struct {
@@ -1809,14 +1810,18 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 
 	// Card 2.0 event bodies are a lossy fallback (title + upgrade notice +
 	// placeholder image) with no elements, so an @all reference only exists
-	// in the original payload. Prefetch it when the group mention gate or
-	// shared group history needs it, and hand it to dispatch so a live card
-	// is fetched once, not twice.
+	// in the original payload. Prefetch it only for the group mention gate
+	// that needs it, with a short budget: onMessage runs before Feishu's
+	// event acknowledgement, and a miss falls back to the event body. Shared
+	// history reuses the same payload; history-only deployments skip the
+	// fetch and keep degraded cards out of history (historyTextWithCard).
 	prefetchedCard := ""
-	if msgType == "interactive" && chatType == "group" && !botMentioned && messageID != "" &&
-		(p.respondToAtEveryoneAndHere || (p.groupChatHistoryShare && !p.groupReplyAll && botOpenID != "")) {
+	cardFetchAttempted := false
+	if p.respondToAtEveryoneAndHere && !p.groupReplyAll && msgType == "interactive" &&
+		chatType == "group" && !botMentioned && messageID != "" {
+		cardFetchAttempted = true
 		prefetchedCard = p.fetchRawCardContentForInbound(ctx, messageID)
-		if p.respondToAtEveryoneAndHere && !atEveryone && cardAtAll(prefetchedCard) {
+		if !atEveryone && cardAtAll(prefetchedCard) {
 			atEveryone = true
 		}
 	}
@@ -1912,7 +1917,10 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
-	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey, prefetchedCard: prefetchedCard}
+	rctx := replyContext{
+		messageID: messageID, chatID: chatID, sessionKey: sessionKey,
+		prefetchedCard: prefetchedCard, cardFetchAttempted: cardFetchAttempted,
+	}
 	var groupHistoryCtx groupHistoryContext
 	if p.groupChatHistoryShare && chatType == "group" && !p.groupReplyAll && botOpenID != "" && (botMentioned || atEveryone) {
 		scope := p.groupHistoryScope(msg, chatID)
@@ -2170,7 +2178,7 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 		// notice); prefer the original payload via user_card_content. For
 		// group cards the gate may already have fetched it.
 		raw := rctx.prefetchedCard
-		if raw == "" {
+		if raw == "" && !rctx.cardFetchAttempted {
 			raw = p.fetchRawCardContent(ctx, messageID)
 		}
 		if raw != "" {
